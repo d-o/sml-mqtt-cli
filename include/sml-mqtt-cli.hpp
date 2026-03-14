@@ -1,0 +1,1118 @@
+/*
+ * Copyright (c) 2025 Dean Sellers (dean@sellers.id.au)
+ * SPDX-License-Identifier: MIT
+ */
+
+#ifndef SML_MQTT_CLI_HPP
+#define SML_MQTT_CLI_HPP
+
+#include <boost/sml.hpp>
+#include <zephyr/kernel.h>
+#include <zephyr/net/mqtt.h>
+#include <zephyr/net/socket.h>
+#include <zephyr/logging/log.h>
+#include <array>
+#include <cstdint>
+#include <cstring>
+#include <new>
+
+LOG_MODULE_DECLARE(sml_mqtt_cli, CONFIG_MQTT_LOG_LEVEL);
+
+namespace sml = boost::sml;
+
+namespace sml_mqtt_cli {
+
+// ============================================================================
+// Configuration from Kconfig (defaults provided for when not using Kconfig)
+// ============================================================================
+
+#ifndef CONFIG_SML_MQTT_CLI_MAX_TOPIC_LEN
+#define CONFIG_SML_MQTT_CLI_MAX_TOPIC_LEN 128
+#endif
+
+#ifndef CONFIG_SML_MQTT_CLI_MAX_PAYLOAD_LEN
+#define CONFIG_SML_MQTT_CLI_MAX_PAYLOAD_LEN 512
+#endif
+
+#ifndef CONFIG_SML_MQTT_CLI_MAX_CLIENT_ID_LEN
+#define CONFIG_SML_MQTT_CLI_MAX_CLIENT_ID_LEN 64
+#endif
+
+#ifndef CONFIG_SML_MQTT_CLI_RX_BUFFER_SIZE
+#define CONFIG_SML_MQTT_CLI_RX_BUFFER_SIZE 256
+#endif
+
+#ifndef CONFIG_SML_MQTT_CLI_TX_BUFFER_SIZE
+#define CONFIG_SML_MQTT_CLI_TX_BUFFER_SIZE 256
+#endif
+
+#ifndef CONFIG_SML_MQTT_CLI_MAX_SUBSCRIPTIONS
+#define CONFIG_SML_MQTT_CLI_MAX_SUBSCRIPTIONS 8
+#endif
+
+#ifndef CONFIG_SML_MQTT_CLI_CONNECT_TIMEOUT_MS
+#define CONFIG_SML_MQTT_CLI_CONNECT_TIMEOUT_MS 5000
+#endif
+
+#ifndef CONFIG_SML_MQTT_CLI_KEEPALIVE_SEC
+#define CONFIG_SML_MQTT_CLI_KEEPALIVE_SEC 60
+#endif
+
+// ============================================================================
+// Forward declarations and types
+// ============================================================================
+
+class mqtt_client;
+
+// Callback types for C API compatibility
+using state_change_cb_t = void (*)(void *user_data, const char *old_state, const char *new_state);
+using publish_received_cb_t = void (*)(void *user_data, const char *topic, const uint8_t *payload, size_t len, enum mqtt_qos qos);
+
+// ============================================================================
+// Events for state machine
+// ============================================================================
+
+struct evt_connect {
+	const char *broker_hostname;
+	uint16_t broker_port;
+	bool use_tls;
+} __attribute__((packed));
+
+struct evt_connack {
+	int result_code;
+	bool session_present;
+} __attribute__((packed));
+
+struct evt_disconnect {
+	int reason;
+} __attribute__((packed));
+
+struct evt_timeout {} __attribute__((packed));
+
+struct evt_publish {
+	const char *topic;
+	const uint8_t *payload;
+	size_t payload_len;
+	enum mqtt_qos qos;
+	bool retain;
+} __attribute__((packed));
+
+struct evt_publish_sent {} __attribute__((packed));
+
+struct evt_puback {
+	uint16_t message_id;
+} __attribute__((packed));
+
+struct evt_pubrec {
+	uint16_t message_id;
+} __attribute__((packed));
+
+struct evt_pubrel {
+	uint16_t message_id;
+} __attribute__((packed));
+
+struct evt_pubcomp {
+	uint16_t message_id;
+} __attribute__((packed));
+
+struct evt_subscribe {
+	const char *topic;
+	enum mqtt_qos qos;
+} __attribute__((packed));
+
+struct evt_suback {
+	uint16_t message_id;
+	enum mqtt_qos granted_qos;
+} __attribute__((packed));
+
+struct evt_unsubscribe {
+	const char *topic;
+} __attribute__((packed));
+
+struct evt_unsuback {
+	uint16_t message_id;
+} __attribute__((packed));
+
+struct evt_send_error {
+	int error_code;
+	const char *operation;
+} __attribute__((packed));
+
+struct evt_publish_received {
+	uint16_t message_id;
+	const char *topic;
+	size_t payload_len;
+	enum mqtt_qos qos;
+} __attribute__((packed));
+
+struct evt_pingresp {} __attribute__((packed));
+
+// ============================================================================
+// Context - holds all client state and buffers
+// ============================================================================
+
+struct mqtt_context {
+	// Zephyr MQTT client (from global namespace, not our class)
+	::mqtt_client client;
+
+	// Static buffers (embedded-friendly)
+	std::array<uint8_t, CONFIG_SML_MQTT_CLI_RX_BUFFER_SIZE> rx_buffer;
+	std::array<uint8_t, CONFIG_SML_MQTT_CLI_TX_BUFFER_SIZE> tx_buffer;
+	std::array<char, CONFIG_SML_MQTT_CLI_MAX_CLIENT_ID_LEN> client_id;
+	std::array<char, CONFIG_SML_MQTT_CLI_MAX_TOPIC_LEN> current_topic;
+	std::array<uint8_t, CONFIG_SML_MQTT_CLI_MAX_PAYLOAD_LEN> current_payload;
+
+	// Broker details
+	struct sockaddr_storage broker_addr;
+
+	// Subscription tracking
+	struct subscription {
+		char topic[CONFIG_SML_MQTT_CLI_MAX_TOPIC_LEN];
+		enum mqtt_qos qos;
+		bool active;
+	};
+	std::array<subscription, CONFIG_SML_MQTT_CLI_MAX_SUBSCRIPTIONS> subscriptions;
+
+	// State tracking
+	bool connected;
+	uint16_t next_message_id;
+	uint16_t pending_message_id;
+	size_t current_payload_len;
+	int64_t last_activity_ms;
+	int64_t connect_start_ms;
+
+	// Callbacks for C API
+	state_change_cb_t state_change_cb;
+	publish_received_cb_t publish_received_cb;
+	void *user_data;
+
+	// Parent client reference
+	mqtt_client *parent;
+
+	mqtt_context() noexcept
+		: client{}, rx_buffer{}, tx_buffer{}, client_id{}, current_topic{}, current_payload{},
+		  broker_addr{}, subscriptions{}, connected(false), next_message_id(1),
+		  pending_message_id(0), current_payload_len(0), last_activity_ms(0),
+		  connect_start_ms(0), state_change_cb(nullptr), publish_received_cb(nullptr),
+		  user_data(nullptr), parent(nullptr) {}
+
+	~mqtt_context() = default;
+
+	// Prevent copying
+	mqtt_context(const mqtt_context&) = delete;
+	mqtt_context& operator=(const mqtt_context&) = delete;
+};
+
+// ============================================================================
+// State Machine Definition - Hierarchical/Composite Architecture
+// ============================================================================
+
+// Publishing submachine - handles outgoing publish message lifecycle
+struct publishing_sm {
+	auto operator()() const noexcept {
+		using namespace sml;
+
+		// Guards for QoS level
+		auto is_qos0 = [](const evt_publish& evt) noexcept -> bool {
+			return evt.qos == MQTT_QOS_0_AT_MOST_ONCE;
+		};
+
+		auto is_qos1 = [](const evt_publish& evt) noexcept -> bool {
+			return evt.qos == MQTT_QOS_1_AT_LEAST_ONCE;
+		};
+
+		auto is_qos2 = [](const evt_publish& evt) noexcept -> bool {
+			return evt.qos == MQTT_QOS_2_EXACTLY_ONCE;
+		};
+
+		// Actions
+		auto send_publish = [](mqtt_context& ctx, const evt_publish& evt) noexcept {
+			ctx.pending_message_id = ctx.next_message_id++;
+		};
+
+		auto on_publish_sent = [](mqtt_context& ctx) noexcept {
+			ctx.pending_message_id = 0;
+		};
+
+		auto handle_puback = [](mqtt_context& ctx, const evt_puback& evt) noexcept {
+			ctx.pending_message_id = 0;
+		};
+
+		auto send_pubrel = [](mqtt_context& ctx, const evt_pubrec& evt) noexcept {
+			// QoS 2 flow
+		};
+
+		auto handle_pubcomp = [](mqtt_context& ctx, const evt_pubcomp& evt) noexcept {
+			ctx.pending_message_id = 0;
+		};
+
+		auto log_error = [](mqtt_context& ctx, const evt_send_error& evt) noexcept {
+			LOG_ERR("Send error in publishing: %d (%s)", evt.error_code, evt.operation);
+		};
+
+		// clang-format off
+		return make_transition_table(
+			// QoS 0 - fire and forget
+			*"idle"_s + event<evt_publish> [is_qos0] / send_publish = "qos0"_s,
+			 "qos0"_s + event<evt_publish_sent> / on_publish_sent = "idle"_s,
+			 "qos0"_s + event<evt_send_error> / log_error = "idle"_s,
+
+			// QoS 1 - at least once
+			 "idle"_s + event<evt_publish> [is_qos1] / send_publish = "qos1"_s,
+			 "qos1"_s + event<evt_puback> / handle_puback = "idle"_s,
+			 "qos1"_s + event<evt_send_error> / log_error = "idle"_s,
+
+			// QoS 2 - exactly once
+			 "idle"_s + event<evt_publish> [is_qos2] / send_publish = "qos2"_s,
+			 "qos2"_s + event<evt_pubrec> / send_pubrel = "releasing"_s,
+			 "qos2"_s + event<evt_send_error> / log_error = "idle"_s,
+			 "releasing"_s + event<evt_pubcomp> / handle_pubcomp = "idle"_s,
+			 "releasing"_s + event<evt_send_error> / log_error = "idle"_s
+		);
+		// clang-format on
+	}
+};
+
+// Receiving submachine - handles incoming publish message lifecycle
+struct receiving_sm {
+	auto operator()() const noexcept {
+		using namespace sml;
+
+		// Guards for QoS level
+		auto is_qos0 = [](const evt_publish_received& evt) noexcept -> bool {
+			return evt.qos == MQTT_QOS_0_AT_MOST_ONCE;
+		};
+
+		auto is_qos1 = [](const evt_publish_received& evt) noexcept -> bool {
+			return evt.qos == MQTT_QOS_1_AT_LEAST_ONCE;
+		};
+
+		auto is_qos2 = [](const evt_publish_received& evt) noexcept -> bool {
+			return evt.qos == MQTT_QOS_2_EXACTLY_ONCE;
+		};
+
+		// Actions
+		auto handle_message = [](mqtt_context& ctx, const evt_publish_received& evt) noexcept {
+			if (evt.topic) {
+				strncpy(ctx.current_topic.data(), evt.topic, ctx.current_topic.size() - 1);
+				ctx.current_topic[ctx.current_topic.size() - 1] = '\0';
+			}
+			ctx.pending_message_id = evt.message_id;
+		};
+
+		auto send_puback = [](mqtt_context& ctx) noexcept {
+			// Send PUBACK for QoS 1
+		};
+
+		auto send_pubrec = [](mqtt_context& ctx) noexcept {
+			// Send PUBREC for QoS 2
+		};
+
+		auto send_pubcomp = [](mqtt_context& ctx, const evt_pubrel& evt) noexcept {
+			// Send PUBCOMP for QoS 2
+			ctx.pending_message_id = 0;
+		};
+
+		auto log_error = [](mqtt_context& ctx, const evt_send_error& evt) noexcept {
+			LOG_ERR("Send error in receiving: %d (%s)", evt.error_code, evt.operation);
+		};
+
+		// clang-format off
+		return make_transition_table(
+			// QoS 0 - no acknowledgment
+			*"idle"_s + event<evt_publish_received> [is_qos0] / handle_message = "processing"_s,
+			 "processing"_s / [] {} = "idle"_s,
+
+			// QoS 1 - acknowledge with PUBACK
+			 "idle"_s + event<evt_publish_received> [is_qos1] / handle_message = "acking"_s,
+			 "acking"_s / send_puback = "idle"_s,
+			 "acking"_s + event<evt_send_error> / log_error = "idle"_s,
+
+			// QoS 2 - four-way handshake
+			 "idle"_s + event<evt_publish_received> [is_qos2] / handle_message = "received"_s,
+			 "received"_s / send_pubrec = "waiting_rel"_s,
+			 "received"_s + event<evt_send_error> / log_error = "idle"_s,
+			 "waiting_rel"_s + event<evt_pubrel> / send_pubcomp = "idle"_s,
+			 "waiting_rel"_s + event<evt_send_error> / log_error = "idle"_s
+		);
+		// clang-format on
+	}
+};
+
+// Main connection state machine
+struct mqtt_state_machine {
+	auto operator()() const noexcept {
+		using namespace sml;
+
+		// Guards
+		auto is_success = [](const evt_connack& evt) noexcept -> bool {
+			return evt.result_code == 0;
+		};
+
+		auto is_timeout = [](mqtt_context& ctx) noexcept -> bool {
+			int64_t now = k_uptime_get();
+			return (now - ctx.connect_start_ms) > CONFIG_SML_MQTT_CLI_CONNECT_TIMEOUT_MS;
+		};
+
+		// Actions
+		auto init_connect = [](mqtt_context& ctx, const evt_connect& evt) noexcept {
+			ctx.connect_start_ms = k_uptime_get();
+			ctx.connected = false;
+		};
+
+		auto send_connect = [](mqtt_context& ctx, const evt_connect& evt) noexcept {
+			// This will be called from actual connect method
+		};
+
+		auto on_connected = [](mqtt_context& ctx) noexcept {
+			ctx.connected = true;
+			ctx.last_activity_ms = k_uptime_get();
+		};
+
+		auto on_connect_failed = [](mqtt_context& ctx, const evt_connack& evt) noexcept {
+			ctx.connected = false;
+		};
+
+		auto on_disconnected = [](mqtt_context& ctx) noexcept {
+			ctx.connected = false;
+		};
+
+		auto cleanup_resources = [](mqtt_context& ctx) noexcept {
+			// Clear subscriptions
+			for (auto& sub : ctx.subscriptions) {
+				sub.active = false;
+			}
+		};
+
+		auto send_subscribe = [](mqtt_context& ctx, const evt_subscribe& evt) noexcept {
+			ctx.pending_message_id = ctx.next_message_id++;
+		};
+
+		auto on_subscribed = [](mqtt_context& ctx, const evt_suback& evt) noexcept {
+			// Find subscription and mark as active
+			for (auto& sub : ctx.subscriptions) {
+				if (!sub.active && sub.topic[0] != '\0') {
+					sub.active = true;
+					break;
+				}
+			}
+			ctx.pending_message_id = 0;
+		};
+
+		auto send_unsubscribe = [](mqtt_context& ctx, const evt_unsubscribe& evt) noexcept {
+			ctx.pending_message_id = ctx.next_message_id++;
+		};
+
+		auto on_unsubscribed = [](mqtt_context& ctx, const evt_unsuback& evt) noexcept {
+			ctx.pending_message_id = 0;
+		};
+
+		auto start_keepalive = [](mqtt_context& ctx) noexcept {
+			ctx.last_activity_ms = k_uptime_get();
+		};
+
+		auto log_error = [](mqtt_context& ctx, const evt_send_error& evt) noexcept {
+			LOG_ERR("Send error in operation '%s': %d",
+			        evt.operation ? evt.operation : "unknown", evt.error_code);
+			ctx.pending_message_id = 0;
+		};
+
+		auto on_keepalive = [](mqtt_context& ctx, const evt_pingresp& evt) noexcept {
+			ctx.last_activity_ms = k_uptime_get();
+		};
+
+		// clang-format off
+		return make_transition_table(
+			// Connection lifecycle
+		   *"Disconnected"_s + event<evt_connect> / init_connect = "Connecting"_s,
+			"Connecting"_s + event<evt_connack> [is_success] / on_connected = "Connected"_s,
+			"Connecting"_s + event<evt_connack> [!is_success] / on_connect_failed = "Disconnected"_s,
+			"Connecting"_s + event<evt_timeout> [is_timeout] / cleanup_resources = "Disconnected"_s,
+			"Connected"_s + event<evt_disconnect> / on_disconnected = "Disconnected"_s,
+
+			// Publishing - enter submachine, stays there handling events
+			"Connected"_s + event<evt_publish> = sml::state<publishing_sm>,
+			sml::state<publishing_sm> + event<evt_disconnect> / on_disconnected = "Disconnected"_s,
+
+			// Receiving - enter submachine, stays there handling events
+			"Connected"_s + event<evt_publish_received> = sml::state<receiving_sm>,
+			sml::state<receiving_sm> + event<evt_disconnect> / on_disconnected = "Disconnected"_s,
+
+			// Subscribing
+			"Connected"_s + event<evt_subscribe> / send_subscribe = "Subscribing"_s,
+			"Subscribing"_s + event<evt_suback> / on_subscribed = "Connected"_s,
+			"Subscribing"_s + event<evt_send_error> / log_error = "Connected"_s,
+			"Subscribing"_s + event<evt_disconnect> / on_disconnected = "Disconnected"_s,
+
+			// Unsubscribing
+			"Connected"_s + event<evt_unsubscribe> / send_unsubscribe = "Unsubscribing"_s,
+			"Unsubscribing"_s + event<evt_unsuback> / on_unsubscribed = "Connected"_s,
+			"Unsubscribing"_s + event<evt_send_error> / log_error = "Connected"_s,
+			"Unsubscribing"_s + event<evt_disconnect> / on_disconnected = "Disconnected"_s,
+
+			// Keepalive
+			"Connected"_s + event<evt_pingresp> / on_keepalive,
+
+			// Entry/Exit actions
+			"Connected"_s + sml::on_entry<_> / start_keepalive,
+			"Disconnected"_s + sml::on_entry<_> / cleanup_resources
+		);
+		// clang-format on
+	}
+};
+
+// ============================================================================
+// MQTT Client Class
+// ============================================================================
+
+class mqtt_client {
+public:
+	mqtt_client() noexcept : ctx_(), sm_(ctx_) {
+		ctx_.parent = this;
+	}
+
+	~mqtt_client() noexcept {
+		if (ctx_.connected) {
+			disconnect();
+		}
+	}
+
+	// Prevent copying
+	mqtt_client(const mqtt_client&) = delete;
+	mqtt_client& operator=(const mqtt_client&) = delete;
+
+	// Initialize client with ID
+	int init(const char *client_id) noexcept {
+		if (!client_id || strlen(client_id) >= CONFIG_SML_MQTT_CLI_MAX_CLIENT_ID_LEN) {
+			return -EINVAL;
+		}
+
+		strncpy(ctx_.client_id.data(), client_id, ctx_.client_id.size() - 1);
+		ctx_.client_id[ctx_.client_id.size() - 1] = '\0';
+
+		mqtt_client_init(&ctx_.client);
+
+		ctx_.client.broker = &ctx_.broker_addr;
+		ctx_.client.evt_cb = reinterpret_cast<mqtt_evt_cb_t>(mqtt_evt_handler_static);
+		ctx_.client.user_data = this;
+		ctx_.client.client_id.utf8 = reinterpret_cast<uint8_t*>(ctx_.client_id.data());
+		ctx_.client.client_id.size = strlen(ctx_.client_id.data());
+		ctx_.client.rx_buf = ctx_.rx_buffer.data();
+		ctx_.client.rx_buf_size = ctx_.rx_buffer.size();
+		ctx_.client.tx_buf = ctx_.tx_buffer.data();
+		ctx_.client.tx_buf_size = ctx_.tx_buffer.size();
+		ctx_.client.keepalive = CONFIG_SML_MQTT_CLI_KEEPALIVE_SEC;
+		ctx_.client.protocol_version = MQTT_VERSION_3_1_1;
+		ctx_.client.user_data = this;
+
+		return 0;
+	}
+
+	// Connect to broker
+	int connect(const char *hostname, uint16_t port, bool use_tls = false) noexcept {
+		if (!hostname) {
+			return -EINVAL;
+		}
+
+		// Resolve hostname
+		struct zsock_addrinfo hints = {}, *res;
+		hints.ai_family = AF_INET;
+		hints.ai_socktype = SOCK_STREAM;
+
+		char port_str[6];
+		snprintf(port_str, sizeof(port_str), "%u", port);
+
+		int ret = zsock_getaddrinfo(hostname, port_str, &hints, &res);
+		if (ret != 0) {
+			return -EHOSTUNREACH;
+		}
+
+		memcpy(&ctx_.broker_addr, res->ai_addr, res->ai_addrlen);
+		zsock_freeaddrinfo(res);
+
+		// Configure transport
+		if (use_tls) {
+#if defined(CONFIG_MQTT_LIB_TLS)
+			ctx_.client.transport.type = MQTT_TRANSPORT_SECURE;
+#else
+			return -ENOTSUP;
+#endif
+		} else {
+			ctx_.client.transport.type = MQTT_TRANSPORT_NON_SECURE;
+		}
+
+		// Send connect event to state machine
+		evt_connect evt = {hostname, port, use_tls};
+		sm_.process_event(evt);
+
+		// Perform actual MQTT connect
+		ret = mqtt_connect(&ctx_.client);
+		if (ret != 0) {
+			evt_connack connack = {ret, false};
+			sm_.process_event(connack);
+			return ret;
+		}
+
+		return 0;
+	}
+
+	// Disconnect from broker
+	int disconnect() noexcept {
+		int ret = mqtt_disconnect(&ctx_.client, nullptr);
+		evt_disconnect evt = {0};
+		sm_.process_event(evt);
+		return ret;
+	}
+
+	// Publish message
+	int publish(const char *topic, const uint8_t *payload, size_t payload_len,
+	            enum mqtt_qos qos = MQTT_QOS_0_AT_MOST_ONCE, bool retain = false) noexcept {
+		if (!topic || !payload || !ctx_.connected) {
+			return -EINVAL;
+		}
+
+		if (strlen(topic) >= CONFIG_SML_MQTT_CLI_MAX_TOPIC_LEN ||
+		    payload_len > CONFIG_SML_MQTT_CLI_MAX_PAYLOAD_LEN) {
+			return -EMSGSIZE;
+		}
+
+		struct mqtt_publish_param param = {};
+		struct mqtt_topic pub_topic = {
+			.topic = {
+				.utf8 = reinterpret_cast<const uint8_t*>(topic),
+				.size = strlen(topic)
+			},
+			.qos = qos
+		};
+
+		param.message.topic = pub_topic;
+		param.message.payload.data = const_cast<uint8_t*>(payload);
+		param.message.payload.len = payload_len;
+		param.message_id = ctx_.next_message_id;
+		param.dup_flag = 0;
+		param.retain_flag = retain ? 1 : 0;
+
+		// Process event
+		evt_publish evt = {topic, payload, payload_len, qos, retain};
+		sm_.process_event(evt);
+
+		int ret = mqtt_publish(&ctx_.client, &param);
+		if (ret == 0 && qos == MQTT_QOS_0_AT_MOST_ONCE) {
+			evt_publish_sent sent = {};
+			sm_.process_event(sent);
+		}
+
+		return ret;
+	}
+
+	// Subscribe to topic
+	int subscribe(const char *topic, enum mqtt_qos qos = MQTT_QOS_0_AT_MOST_ONCE) noexcept {
+		if (!topic || !ctx_.connected) {
+			return -EINVAL;
+		}
+
+		if (strlen(topic) >= CONFIG_SML_MQTT_CLI_MAX_TOPIC_LEN) {
+			return -EMSGSIZE;
+		}
+
+		// Find free subscription slot
+		int slot = -1;
+		for (size_t i = 0; i < ctx_.subscriptions.size(); i++) {
+			if (!ctx_.subscriptions[i].active) {
+				slot = i;
+				break;
+			}
+		}
+
+		if (slot < 0) {
+			return -ENOMEM;
+		}
+
+		strncpy(ctx_.subscriptions[slot].topic, topic, CONFIG_SML_MQTT_CLI_MAX_TOPIC_LEN - 1);
+		ctx_.subscriptions[slot].topic[CONFIG_SML_MQTT_CLI_MAX_TOPIC_LEN - 1] = '\0';
+		ctx_.subscriptions[slot].qos = qos;
+
+		struct mqtt_topic sub_topic = {
+			.topic = {
+				.utf8 = reinterpret_cast<uint8_t*>(ctx_.subscriptions[slot].topic),
+				.size = strlen(ctx_.subscriptions[slot].topic)
+			},
+			.qos = qos
+		};
+
+		struct mqtt_subscription_list sub_list = {
+			.list = &sub_topic,
+			.list_count = 1,
+			.message_id = ctx_.next_message_id
+		};
+
+		evt_subscribe evt = {topic, qos};
+		sm_.process_event(evt);
+
+		return mqtt_subscribe(&ctx_.client, &sub_list);
+	}
+
+	// Unsubscribe from topic
+	int unsubscribe(const char *topic) noexcept {
+		if (!topic || !ctx_.connected) {
+			return -EINVAL;
+		}
+
+		// Find subscription
+		int slot = -1;
+		for (size_t i = 0; i < ctx_.subscriptions.size(); i++) {
+			if (ctx_.subscriptions[i].active &&
+			    strcmp(ctx_.subscriptions[i].topic, topic) == 0) {
+				slot = i;
+				break;
+			}
+		}
+
+		if (slot < 0) {
+			return -ENOENT;
+		}
+
+		struct mqtt_topic unsub_topic = {
+			.topic = {
+				.utf8 = reinterpret_cast<uint8_t*>(ctx_.subscriptions[slot].topic),
+				.size = strlen(ctx_.subscriptions[slot].topic)
+			},
+			.qos = MQTT_QOS_0_AT_MOST_ONCE
+		};
+
+		struct mqtt_subscription_list unsub_list = {
+			.list = &unsub_topic,
+			.list_count = 1,
+			.message_id = ctx_.next_message_id
+		};
+
+		evt_unsubscribe evt = {topic};
+		sm_.process_event(evt);
+
+		int ret = mqtt_unsubscribe(&ctx_.client, &unsub_list);
+		if (ret == 0) {
+			ctx_.subscriptions[slot].active = false;
+		}
+
+		return ret;
+	}
+
+	// Process incoming data (call periodically)
+	int input() noexcept {
+		if (!ctx_.connected) {
+			return -ENOTCONN;
+		}
+		return mqtt_input(&ctx_.client);
+	}
+
+	// Keep connection alive (call periodically)
+	int live() noexcept {
+		if (!ctx_.connected) {
+			return -ENOTCONN;
+		}
+		return mqtt_live(&ctx_.client);
+	}
+
+	// Check if connected
+	bool is_connected() const noexcept {
+		return ctx_.connected;
+	}
+
+	// Get current state name
+	const char* get_state() const noexcept {
+		const char* state_name = "Unknown";
+		sm_.visit_current_states([&state_name](auto state) {
+			state_name = state.c_str();
+		});
+		return state_name;
+	}
+
+	// Set callbacks for C API
+	void set_state_change_callback(state_change_cb_t cb, void *user_data = nullptr) noexcept {
+		ctx_.state_change_cb = cb;
+		ctx_.user_data = user_data;
+	}
+
+	void set_publish_received_callback(publish_received_cb_t cb, void *user_data = nullptr) noexcept {
+		ctx_.publish_received_cb = cb;
+		ctx_.user_data = user_data;
+	}
+
+	// Get context (for testing/debugging)
+	mqtt_context& get_context() noexcept {
+		return ctx_;
+	}
+
+private:
+	mqtt_context ctx_;
+	sml::sm<mqtt_state_machine> sm_;
+
+	// Static MQTT event handler wrapper
+	static void mqtt_evt_handler_static(::mqtt_client *client, const struct mqtt_evt *evt) {
+		if (!client || !client->user_data) {
+			return;
+		}
+
+		mqtt_client *self = static_cast<mqtt_client*>(client->user_data);
+		self->mqtt_evt_handler(evt);
+	}
+
+	// MQTT event handler
+	void mqtt_evt_handler(const struct mqtt_evt *evt) noexcept {
+		switch (evt->type) {
+		case MQTT_EVT_CONNACK: {
+			evt_connack connack = {evt->result, false};
+			sm_.process_event(connack);
+			break;
+		}
+		case MQTT_EVT_DISCONNECT: {
+			evt_disconnect disc = {evt->result};
+			sm_.process_event(disc);
+			break;
+		}
+		case MQTT_EVT_PUBLISH: {
+			// Read the topic
+			const struct mqtt_publish_param *p = &evt->param.publish;
+			size_t topic_len = p->message.topic.topic.size;
+			if (topic_len >= CONFIG_SML_MQTT_CLI_MAX_TOPIC_LEN) {
+				topic_len = CONFIG_SML_MQTT_CLI_MAX_TOPIC_LEN - 1;
+			}
+
+			memcpy(ctx_.current_topic.data(), p->message.topic.topic.utf8, topic_len);
+			ctx_.current_topic[topic_len] = '\0';
+
+			// Read payload
+			size_t payload_len = p->message.payload.len;
+			if (payload_len > CONFIG_SML_MQTT_CLI_MAX_PAYLOAD_LEN) {
+				payload_len = CONFIG_SML_MQTT_CLI_MAX_PAYLOAD_LEN;
+			}
+
+			int ret = mqtt_read_publish_payload(&ctx_.client, ctx_.current_payload.data(), payload_len);
+			if (ret > 0) {
+				ctx_.current_payload_len = ret;
+			}
+
+			evt_publish_received pub_evt = {
+				p->message_id,
+				ctx_.current_topic.data(),
+				ctx_.current_payload_len,
+				static_cast<mqtt_qos>(p->message.topic.qos)
+			};
+			sm_.process_event(pub_evt);
+
+			// Call user callback
+			if (ctx_.publish_received_cb) {
+				ctx_.publish_received_cb(ctx_.user_data, ctx_.current_topic.data(),
+				                        ctx_.current_payload.data(), ctx_.current_payload_len,
+				                        static_cast<mqtt_qos>(p->message.topic.qos));
+			}
+
+			// Send acknowledgment
+			int ack_ret = 0;
+			if (p->message.topic.qos == MQTT_QOS_1_AT_LEAST_ONCE) {
+				struct mqtt_puback_param ack = {p->message_id};
+				ack_ret = mqtt_publish_qos1_ack(&ctx_.client, &ack);
+				if (ack_ret < 0) {
+					LOG_ERR("Failed to send PUBACK: %d", ack_ret);
+					evt_send_error err = {ack_ret, "puback"};
+					sm_.process_event(err);
+				}
+			} else if (p->message.topic.qos == MQTT_QOS_2_EXACTLY_ONCE) {
+				struct mqtt_pubrec_param rec = {p->message_id};
+				ack_ret = mqtt_publish_qos2_receive(&ctx_.client, &rec);
+				if (ack_ret < 0) {
+					LOG_ERR("Failed to send PUBREC: %d", ack_ret);
+					evt_send_error err = {ack_ret, "pubrec"};
+					sm_.process_event(err);
+				}
+			}
+			break;
+		}
+		case MQTT_EVT_PUBACK: {
+			evt_puback ack = {evt->param.puback.message_id};
+			sm_.process_event(ack);
+			break;
+		}
+		case MQTT_EVT_PUBREC: {
+			evt_pubrec rec = {evt->param.pubrec.message_id};
+			sm_.process_event(rec);
+
+			// Send PUBREL
+			struct mqtt_pubrel_param rel = {evt->param.pubrec.message_id};
+			int ret = mqtt_publish_qos2_release(&ctx_.client, &rel);
+			if (ret < 0) {
+				LOG_ERR("Failed to send PUBREL: %d", ret);
+				evt_send_error err = {ret, "pubrel"};
+				sm_.process_event(err);
+			}
+			break;
+		}
+		case MQTT_EVT_PUBREL: {
+			evt_pubrel rel = {evt->param.pubrel.message_id};
+			sm_.process_event(rel);
+
+			// Send PUBCOMP
+			struct mqtt_pubcomp_param comp = {evt->param.pubrel.message_id};
+			int ret = mqtt_publish_qos2_complete(&ctx_.client, &comp);
+			if (ret < 0) {
+				LOG_ERR("Failed to send PUBCOMP: %d", ret);
+				evt_send_error err = {ret, "pubcomp"};
+				sm_.process_event(err);
+			}
+			break;
+		}
+		case MQTT_EVT_PUBCOMP: {
+			evt_pubcomp comp = {evt->param.pubcomp.message_id};
+			sm_.process_event(comp);
+			break;
+		}
+		case MQTT_EVT_SUBACK: {
+			evt_suback ack = {evt->param.suback.message_id, MQTT_QOS_0_AT_MOST_ONCE};
+			sm_.process_event(ack);
+			break;
+		}
+		case MQTT_EVT_UNSUBACK: {
+			evt_unsuback ack = {evt->param.unsuback.message_id};
+			sm_.process_event(ack);
+			break;
+		}
+		case MQTT_EVT_PINGRESP: {
+			evt_pingresp ping = {};
+			sm_.process_event(ping);
+			break;
+		}
+		default:
+			break;
+		}
+	}
+};
+
+} // namespace sml_mqtt_cli
+
+// ============================================================================
+// C API for use from C applications
+// ============================================================================
+
+extern "C" {
+
+typedef void* sml_mqtt_client_handle_t;
+
+/**
+ * @brief Size macro for MQTT client storage (for static allocation)
+ * Use this macro for static array declarations to avoid VLA issues
+ */
+#define SML_MQTT_CLIENT_SIZE sizeof(sml_mqtt_cli::mqtt_client)
+
+/**
+ * @brief Get the size required for MQTT client storage
+ * @return Size in bytes needed for sml_mqtt_client_init_with_storage()
+ *
+ * Use this to allocate storage for the client:
+ * @code
+ * static uint8_t client_storage[SML_MQTT_CLIENT_SIZE];
+ * @endcode
+ */
+static inline size_t sml_mqtt_client_get_size(void) {
+	return SML_MQTT_CLIENT_SIZE;
+}
+
+/**
+ * @brief Initialize a new MQTT client instance using user-provided storage
+ * @param storage Pointer to storage buffer (must be at least sml_mqtt_client_get_size() bytes)
+ * @param storage_size Size of storage buffer
+ * @return Handle to the client or NULL on failure
+ *
+ * @note Storage must remain valid for the lifetime of the client
+ * @note Storage must be properly aligned (alignof(mqtt_client))
+ *
+ * Example:
+ * @code
+ * static uint8_t client_storage[sml_mqtt_client_get_size()] __attribute__((aligned(8)));
+ * sml_mqtt_client_handle_t client = sml_mqtt_client_init_with_storage(client_storage, sizeof(client_storage));
+ * @endcode
+ */
+static inline sml_mqtt_client_handle_t sml_mqtt_client_init_with_storage(void *storage, size_t storage_size) {
+	if (!storage || storage_size < sizeof(sml_mqtt_cli::mqtt_client)) {
+		return nullptr;
+	}
+
+	// Check alignment
+	if (reinterpret_cast<uintptr_t>(storage) % alignof(sml_mqtt_cli::mqtt_client) != 0) {
+		return nullptr;
+	}
+
+	// Placement new - construct object in user-provided memory
+	return new (storage) sml_mqtt_cli::mqtt_client();
+}
+
+/**
+ * @brief Deinitialize an MQTT client instance (does not free storage)
+ * @param handle Client handle
+ *
+ * @note This calls the destructor but does not free memory.
+ *       Storage remains owned by the caller.
+ */
+static inline void sml_mqtt_client_deinit(sml_mqtt_client_handle_t handle) {
+	if (handle) {
+		// Call destructor explicitly
+		static_cast<sml_mqtt_cli::mqtt_client*>(handle)->~mqtt_client();
+		// Storage is not freed - user owns it
+	}
+}
+
+/**
+ * @brief Initialize MQTT client
+ * @param handle Client handle
+ * @param client_id Client identifier string
+ * @return 0 on success, negative error code on failure
+ */
+static inline int sml_mqtt_client_init(sml_mqtt_client_handle_t handle, const char *client_id) {
+	if (!handle) {
+		return -EINVAL;
+	}
+	return static_cast<sml_mqtt_cli::mqtt_client*>(handle)->init(client_id);
+}
+
+/**
+ * @brief Connect to MQTT broker
+ * @param handle Client handle
+ * @param hostname Broker hostname
+ * @param port Broker port
+ * @param use_tls Use TLS/SSL
+ * @return 0 on success, negative error code on failure
+ */
+static inline int sml_mqtt_client_connect(sml_mqtt_client_handle_t handle, const char *hostname,
+                             uint16_t port, bool use_tls) {
+	if (!handle) {
+		return -EINVAL;
+	}
+	return static_cast<sml_mqtt_cli::mqtt_client*>(handle)->connect(hostname, port, use_tls);
+}
+
+/**
+ * @brief Disconnect from MQTT broker
+ * @param handle Client handle
+ * @return 0 on success, negative error code on failure
+ */
+static inline int sml_mqtt_client_disconnect(sml_mqtt_client_handle_t handle) {
+	if (!handle) {
+		return -EINVAL;
+	}
+	return static_cast<sml_mqtt_cli::mqtt_client*>(handle)->disconnect();
+}
+
+/**
+ * @brief Publish a message
+ * @param handle Client handle
+ * @param topic Topic string
+ * @param payload Message payload
+ * @param payload_len Payload length in bytes
+ * @param qos Quality of Service level
+ * @param retain Retain flag
+ * @return 0 on success, negative error code on failure
+ */
+static inline int sml_mqtt_client_publish(sml_mqtt_client_handle_t handle, const char *topic,
+                             const uint8_t *payload, size_t payload_len,
+                             enum mqtt_qos qos, bool retain) {
+	if (!handle) {
+		return -EINVAL;
+	}
+	return static_cast<sml_mqtt_cli::mqtt_client*>(handle)->publish(topic, payload, payload_len, qos, retain);
+}
+
+/**
+ * @brief Subscribe to a topic
+ * @param handle Client handle
+ * @param topic Topic string
+ * @param qos Quality of Service level
+ * @return 0 on success, negative error code on failure
+ */
+static inline int sml_mqtt_client_subscribe(sml_mqtt_client_handle_t handle, const char *topic, enum mqtt_qos qos) {
+	if (!handle) {
+		return -EINVAL;
+	}
+	return static_cast<sml_mqtt_cli::mqtt_client*>(handle)->subscribe(topic, qos);
+}
+
+/**
+ * @brief Unsubscribe from a topic
+ * @param handle Client handle
+ * @param topic Topic string
+ * @return 0 on success, negative error code on failure
+ */
+static inline int sml_mqtt_client_unsubscribe(sml_mqtt_client_handle_t handle, const char *topic) {
+	if (!handle) {
+		return -EINVAL;
+	}
+	return static_cast<sml_mqtt_cli::mqtt_client*>(handle)->unsubscribe(topic);
+}
+
+/**
+ * @brief Process incoming MQTT data
+ * @param handle Client handle
+ * @return 0 on success, negative error code on failure
+ */
+static inline int sml_mqtt_client_input(sml_mqtt_client_handle_t handle) {
+	if (!handle) {
+		return -EINVAL;
+	}
+	return static_cast<sml_mqtt_cli::mqtt_client*>(handle)->input();
+}
+
+/**
+ * @brief Keep connection alive (call periodically)
+ * @param handle Client handle
+ * @return 0 on success, negative error code on failure
+ */
+static inline int sml_mqtt_client_live(sml_mqtt_client_handle_t handle) {
+	if (!handle) {
+		return -EINVAL;
+	}
+	return static_cast<sml_mqtt_cli::mqtt_client*>(handle)->live();
+}
+
+/**
+ * @brief Check if client is connected
+ * @param handle Client handle
+ * @return true if connected, false otherwise
+ */
+static inline bool sml_mqtt_client_is_connected(sml_mqtt_client_handle_t handle) {
+	if (!handle) {
+		return false;
+	}
+	return static_cast<sml_mqtt_cli::mqtt_client*>(handle)->is_connected();
+}
+
+/**
+ * @brief Set state change callback
+ * @param handle Client handle
+ * @param cb Callback function
+ * @param user_data User data passed to callback
+ */
+static inline void sml_mqtt_client_set_state_change_callback(sml_mqtt_client_handle_t handle,
+                                                sml_mqtt_cli::state_change_cb_t cb,
+                                                void *user_data) {
+	if (!handle) {
+		return;
+	}
+	static_cast<sml_mqtt_cli::mqtt_client*>(handle)->set_state_change_callback(cb, user_data);
+}
+
+/**
+ * @brief Set publish received callback
+ * @param handle Client handle
+ * @param cb Callback function
+ * @param user_data User data passed to callback
+ */
+static inline void sml_mqtt_client_set_publish_received_callback(sml_mqtt_client_handle_t handle,
+                                                    sml_mqtt_cli::publish_received_cb_t cb,
+                                                    void *user_data) {
+	if (!handle) {
+		return;
+	}
+	static_cast<sml_mqtt_cli::mqtt_client*>(handle)->set_publish_received_callback(cb, user_data);
+}
+
+} // extern "C"
+
+#endif // SML_MQTT_CLI_HPP

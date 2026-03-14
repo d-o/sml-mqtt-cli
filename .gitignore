@@ -1,0 +1,52 @@
+# Build artifacts
+build/
+build-*/
+*.elf
+*.hex
+*.bin
+*.map
+*.o
+*.a
+*.so
+*.d
+
+# Zephyr build system
+.west/
+.cache/
+outdir/
+twister-out*/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Test results
+junit.xml
+testresults.xml
+twister.log
+
+# Documentation build
+doc/_build/
+doc/doxygen/
+
+# Backup files
+*.bak
+*.backup
+*.orig
+
+# Core dumps
+core
+core.*

@@ -1,0 +1,28 @@
+# Copyright (c) 2025 Dean Sellers (dean@sellers.id.au)
+# SPDX-License-Identifier: MIT
+
+manifest:
+  remotes:
+    - name: zephyrproject-rtos
+      url-base: https://github.com/zephyrproject-rtos
+
+  defaults:
+    remote: zephyrproject-rtos
+
+  projects:
+    - name: zephyr
+      remote: zephyrproject-rtos
+      revision: v4.3-branch
+      clone-depth: 1
+      west-commands: scripts/west-commands.yml
+
+    - name: boost-sml
+      url: https://github.com/d-o/sml.git
+      revision: zephyr_module
+
+    - name: sml-mqtt-cli
+      url: https://github.com/d-o/sml-mqtt-cli.git
+      revision: main
+
+  self:
+    path: app

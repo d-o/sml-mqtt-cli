@@ -1,0 +1,6 @@
+# Copyright (c) 2025 Dean Sellers (dean@sellers.id.au)
+# SPDX-License-Identifier: MIT
+
+build:
+  cmake: zephyr
+  kconfig: zephyr/Kconfig

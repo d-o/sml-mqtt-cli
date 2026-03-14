@@ -1,0 +1,71 @@
+# Copyright (c) 2025 Dean Sellers (dean@sellers.id.au)
+# SPDX-License-Identifier: MIT
+
+config LIB_SML_MQTT_CLI
+    bool "Include the sml-mqtt-cli library."
+    default n
+    depends on LIB_BOOST_SML && MQTT_LIB && !MQTT_VERSION_5_0 && CPP && STD_CPP17
+    help
+      Enable use of the boost::sml powered C++ MQTT client library
+
+if LIB_SML_MQTT_CLI
+
+config SML_MQTT_CLI_MAX_TOPIC_LEN
+	int "Maximum topic length"
+	default 128
+	help
+	  Maximum length of MQTT topic strings (including null terminator).
+	  Increase this if you need to support longer topic names.
+
+config SML_MQTT_CLI_MAX_PAYLOAD_LEN
+	int "Maximum payload length"
+	default 512
+	help
+	  Maximum length of MQTT message payload that can be stored in the
+	  static buffer. Messages larger than this will be truncated.
+
+config SML_MQTT_CLI_MAX_CLIENT_ID_LEN
+	int "Maximum client ID length"
+	default 64
+	help
+	  Maximum length of MQTT client identifier (including null terminator).
+
+config SML_MQTT_CLI_RX_BUFFER_SIZE
+	int "Receive buffer size"
+	default 256
+	help
+	  Size of the static receive buffer for incoming MQTT packets.
+	  Should be at least 128 bytes. Increase for larger messages.
+
+config SML_MQTT_CLI_TX_BUFFER_SIZE
+	int "Transmit buffer size"
+	default 256
+	help
+	  Size of the static transmit buffer for outgoing MQTT packets.
+	  Should be at least 128 bytes. Increase for larger messages.
+
+config SML_MQTT_CLI_MAX_SUBSCRIPTIONS
+	int "Maximum number of subscriptions"
+	default 8
+	help
+	  Maximum number of topics that can be subscribed to simultaneously
+	  per client instance. Each subscription uses approximately 132 bytes
+	  of RAM (topic buffer + metadata).
+
+config SML_MQTT_CLI_CONNECT_TIMEOUT_MS
+	int "Connection timeout in milliseconds"
+	default 5000
+	help
+	  Maximum time to wait for MQTT connection acknowledgment.
+	  If no CONNACK is received within this time, the connection
+	  attempt is aborted and returns to Disconnected state.
+
+config SML_MQTT_CLI_KEEPALIVE_SEC
+	int "Keep-alive interval in seconds"
+	default 60
+	help
+	  MQTT keep-alive interval sent in the CONNECT packet.
+	  The broker will close the connection if no messages are
+	  received within 1.5x this interval. Set to 0 to disable.
+
+endif # LIB_SML_MQTT_CLI
