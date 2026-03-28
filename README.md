@@ -73,10 +73,10 @@ stateDiagram-v2
         [*] --> pub_idle
         pub_idle --> qos0: publish [QoS 0]
         qos0 --> pub_idle: sent / error
-        
+
         pub_idle --> qos1: publish [QoS 1]
         qos1 --> pub_idle: PUBACK / error
-        
+
         pub_idle --> qos2: publish [QoS 2]
         qos2 --> releasing: PUBREC
         qos2 --> pub_idle: error
@@ -87,10 +87,10 @@ stateDiagram-v2
         [*] --> recv_idle
         recv_idle --> processing: PUBLISH [QoS 0]
         processing --> recv_idle: handled
-        
+
         recv_idle --> acking: PUBLISH [QoS 1]
         acking --> recv_idle: PUBACK sent / error
-        
+
         recv_idle --> received: PUBLISH [QoS 2]
         received --> waiting_rel: PUBREC sent
         received --> recv_idle: error
@@ -99,10 +99,10 @@ stateDiagram-v2
 
     Connected --> publishing_sm: publish event
     Connected --> receiving_sm: PUBLISH received
-    
+
     Connected --> Subscribing: subscribe
     Subscribing --> Connected: SUBACK / error
-    
+
     Connected --> Unsubscribing: unsubscribe
     Unsubscribing --> Connected: UNSUBACK / error
 

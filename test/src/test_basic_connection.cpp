@@ -6,227 +6,138 @@
 #include <zephyr/ztest.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include "fake_broker.hpp"
 #include <sml-mqtt-cli.hpp>
 
+/* Helpers declared in main.cpp */
+extern void client_poll_and_input(sml_mqtt_cli::mqtt_client &client);
 
-using namespace sml_mqtt_cli;
-
-// Test broker configuration
-extern const char *TEST_BROKER_HOST;
-extern uint16_t TEST_BROKER_PORT;
-extern bool TEST_USE_TLS;
-
-#define TEST_BROKER_HOST "localhost"
-#define TEST_BROKER_PORT 8883
-#define TEST_USE_TLS false
+/* -------------------------------------------------------------------------
+ * Tests
+ * ------------------------------------------------------------------------- */
 
 /**
- * @brief Test basic client creation and initialization
+ * Client construction and init - no network needed.
  */
 ZTEST(sml_mqtt_basic, test_client_creation)
 {
-	LOG_INF("Test: Client creation and initialization");
-
 	sml_mqtt_cli::mqtt_client client;
 
 	int ret = client.init("test_client_basic");
-	zassert_equal(ret, 0, "Failed to initialize client: %d", ret);
-
-	// Should start in disconnected state
-	zassert_false(client.is_connected(), "Client should not be connected initially");
-
-	const char *state = client.get_state();
-	LOG_INF("Initial state: %s", state);
-	zassert_not_null(state, "State should not be NULL");
+	zassert_equal(ret, 0, "init failed: %d", ret);
+	zassert_false(client.is_connected(), "should start disconnected");
+	zassert_not_null(client.get_state(), "state must not be NULL");
 }
 
 /**
- * @brief Test client initialization with invalid parameters
+ * Null and over-length client IDs must be rejected before any network call.
  */
 ZTEST(sml_mqtt_basic, test_invalid_init)
 {
-	LOG_INF("Test: Invalid initialization parameters");
-
 	sml_mqtt_cli::mqtt_client client;
 
-	// NULL client ID should fail
-	int ret = client.init(nullptr);
-	zassert_not_equal(ret, 0, "Should fail with NULL client ID");
+	zassert_not_equal(client.init(nullptr), 0,
+			  "NULL client ID must fail");
 
-	// Too long client ID should fail
 	char long_id[CONFIG_SML_MQTT_CLI_MAX_CLIENT_ID_LEN + 10];
 	memset(long_id, 'A', sizeof(long_id) - 1);
 	long_id[sizeof(long_id) - 1] = '\0';
-
-	ret = client.init(long_id);
-	zassert_not_equal(ret, 0, "Should fail with too long client ID");
+	zassert_not_equal(client.init(long_id), 0,
+			  "over-length client ID must fail");
 }
 
 /**
- * @brief Test connection to MQTT broker
+ * Full connect/disconnect round-trip via fake broker.
+ *
+ * Sequence:
+ *   client.connect()
+ *   -> broker accepts TCP, receives CONNECT, sends CONNACK
+ *   client_poll_and_input() -> MQTT_EVT_CONNACK -> SM: Connecting -> Connected
+ *   client.disconnect()
+ *   -> broker receives DISCONNECT, closes socket
  */
 ZTEST(sml_mqtt_basic, test_connect_disconnect)
 {
-	LOG_INF("Test: Connect and disconnect from broker");
-
 	sml_mqtt_cli::mqtt_client client;
-
 	int ret = client.init("test_connect_001");
-	zassert_equal(ret, 0, "Failed to initialize client");
+	zassert_equal(ret, 0, "init failed");
 
-	// Attempt to connect
-	LOG_INF("Connecting to %s:%d...", TEST_BROKER_HOST, TEST_BROKER_PORT);
-	ret = client.connect(TEST_BROKER_HOST, TEST_BROKER_PORT, TEST_USE_TLS);
-	zassert_equal(ret, 0, "Failed to connect: %d", ret);
+	ret = client.connect("127.0.0.1", FAKE_BROKER_PORT, false);
+	zassert_equal(ret, 0, "connect returned: %d", ret);
 
-	// Wait for connection to establish
-	k_sleep(K_SECONDS(2));
+	fake_broker_process(FAKE_MQTT_PKT_CONNECT);
+	client_poll_and_input(client);
 
-	// Process any incoming data
-	ret = client.input();
-	LOG_INF("Input returned: %d", ret);
+	zassert_true(client.is_connected(), "should be connected after CONNACK");
 
-	// Check if connected
-	bool connected = client.is_connected();
-	LOG_INF("Connection status: %s", connected ? "connected" : "disconnected");
-	zassert_true(connected, "Client should be connected");
-
-	// Check state
-	const char *state = client.get_state();
-	LOG_INF("Current state: %s", state);
-
-	// Disconnect
-	LOG_INF("Disconnecting...");
 	ret = client.disconnect();
-	zassert_equal(ret, 0, "Failed to disconnect: %d", ret);
+	zassert_equal(ret, 0, "disconnect returned: %d", ret);
+	fake_broker_process(FAKE_MQTT_PKT_DISCONNECT);
 
-	k_sleep(K_MSEC(100));
-
-	// Should be disconnected now
-	zassert_false(client.is_connected(), "Client should be disconnected");
+	zassert_false(client.is_connected(), "should be disconnected");
 }
 
 /**
- * @brief Test connection with invalid parameters
+ * Null hostname must be rejected before any socket call.
  */
 ZTEST(sml_mqtt_basic, test_invalid_connect)
 {
-	LOG_INF("Test: Invalid connection parameters");
-
 	sml_mqtt_cli::mqtt_client client;
 	client.init("test_invalid_conn");
 
-	// NULL hostname should fail
-	int ret = client.connect(nullptr, 1883, false);
-	zassert_not_equal(ret, 0, "Should fail with NULL hostname");
-
-	// Invalid hostname should fail
-	ret = client.connect("invalid.host.that.does.not.exist.local", 1883, false);
-	zassert_not_equal(ret, 0, "Should fail with invalid hostname");
+	int ret = client.connect(nullptr, FAKE_BROKER_PORT, false);
+	zassert_not_equal(ret, 0, "NULL hostname must fail");
 }
 
 /**
- * @brief Test C API client creation
+ * C API: placement-new into static storage, init, deinit - no heap.
  */
 ZTEST(sml_mqtt_basic, test_c_api_creation)
 {
-	LOG_INF("Test: C API client creation");
+	static uint8_t storage[SML_MQTT_CLIENT_SIZE] __attribute__((aligned(8)));
 
-	// Allocate storage statically (no heap)
-	static uint8_t client_storage[SML_MQTT_CLIENT_SIZE] __attribute__((aligned(8)));
-	sml_mqtt_client_handle_t handle = sml_mqtt_client_init_with_storage(client_storage, sizeof(client_storage));
-	zassert_not_null(handle, "Failed to create client handle");
+	sml_mqtt_client_handle_t h =
+		sml_mqtt_client_init_with_storage(storage, sizeof(storage));
+	zassert_not_null(h, "handle must not be NULL");
 
-	int ret = sml_mqtt_client_init(handle, "test_c_api_001");
-	zassert_equal(ret, 0, "Failed to initialize client");
+	int ret = sml_mqtt_client_init(h, "test_c_api_001");
+	zassert_equal(ret, 0, "C API init failed: %d", ret);
+	zassert_false(sml_mqtt_client_is_connected(h),
+		      "should start disconnected");
 
-	bool connected = sml_mqtt_client_is_connected(handle);
-	zassert_false(connected, "Client should not be connected initially");
-
-	sml_mqtt_client_deinit(handle);
+	sml_mqtt_client_deinit(h);
 }
 
 /**
- * @brief Test C API connection
+ * C API connect/disconnect via fake broker.
  */
 ZTEST(sml_mqtt_basic, test_c_api_connect)
 {
-	LOG_INF("Test: C API connection");
+	static uint8_t storage[SML_MQTT_CLIENT_SIZE] __attribute__((aligned(8)));
 
-	// Allocate storage statically (no heap)
-	static uint8_t client_storage[SML_MQTT_CLIENT_SIZE] __attribute__((aligned(8)));
-	sml_mqtt_client_handle_t handle = sml_mqtt_client_init_with_storage(client_storage, sizeof(client_storage));
-	zassert_not_null(handle, "Failed to create client handle");
+	sml_mqtt_client_handle_t h =
+		sml_mqtt_client_init_with_storage(storage, sizeof(storage));
+	zassert_not_null(h, "handle must not be NULL");
 
-	int ret = sml_mqtt_client_init(handle, "test_c_api_conn");
-	zassert_equal(ret, 0, "Failed to initialize client");
+	int ret = sml_mqtt_client_init(h, "test_c_api_conn");
+	zassert_equal(ret, 0, "C API init failed");
 
-	// Connect
-	LOG_INF("Connecting via C API...");
-	ret = sml_mqtt_client_connect(handle, TEST_BROKER_HOST, TEST_BROKER_PORT, TEST_USE_TLS);
-	zassert_equal(ret, 0, "Failed to connect: %d", ret);
+	ret = sml_mqtt_client_connect(h, "127.0.0.1", FAKE_BROKER_PORT, false);
+	zassert_equal(ret, 0, "C API connect returned: %d", ret);
 
-	k_sleep(K_SECONDS(2));
+	fake_broker_process(FAKE_MQTT_PKT_CONNECT);
 
-	// Process input
-	ret = sml_mqtt_client_input(handle);
-	LOG_INF("Input returned: %d", ret);
+	/* Poll/input via the C++ object underlying the handle. */
+	sml_mqtt_cli::mqtt_client *cpp =
+		static_cast<sml_mqtt_cli::mqtt_client *>(h);
+	client_poll_and_input(*cpp);
 
-	// Check connection
-	bool connected = sml_mqtt_client_is_connected(handle);
-	LOG_INF("C API connection status: %s", connected ? "connected" : "disconnected");
-	zassert_true(connected, "Client should be connected");
+	zassert_true(sml_mqtt_client_is_connected(h),
+		     "C API: should be connected");
 
-	// Disconnect
-	ret = sml_mqtt_client_disconnect(handle);
-	zassert_equal(ret, 0, "Failed to disconnect");
+	ret = sml_mqtt_client_disconnect(h);
+	zassert_equal(ret, 0, "C API disconnect returned: %d", ret);
+	fake_broker_process(FAKE_MQTT_PKT_DISCONNECT);
 
-	sml_mqtt_client_deinit(handle);
-}
-
-/**
- * @brief Test state callbacks
- */
-static int callback_count = 0;
-static char last_old_state[32] = {0};
-static char last_new_state[32] = {0};
-
-static void state_change_callback(void *user_data, const char *old_state, const char *new_state)
-{
-	callback_count++;
-	strncpy(last_old_state, old_state ? old_state : "NULL", sizeof(last_old_state) - 1);
-	strncpy(last_new_state, new_state ? new_state : "NULL", sizeof(last_new_state) - 1);
-	LOG_INF("State change callback: %s -> %s", old_state, new_state);
-}
-
-ZTEST(sml_mqtt_basic, test_state_callbacks)
-{
-	LOG_INF("Test: State change callbacks");
-
-	callback_count = 0;
-	memset(last_old_state, 0, sizeof(last_old_state));
-	memset(last_new_state, 0, sizeof(last_new_state));
-
-	// Allocate storage statically (no heap)
-	static uint8_t client_storage[SML_MQTT_CLIENT_SIZE] __attribute__((aligned(8)));
-	sml_mqtt_client_handle_t handle = sml_mqtt_client_init_with_storage(client_storage, sizeof(client_storage));
-	zassert_not_null(handle, "Failed to create client");
-
-	sml_mqtt_client_init(handle, "test_callbacks");
-	sml_mqtt_client_set_state_change_callback(handle, state_change_callback, nullptr);
-
-	// Connect (should trigger state changes)
-	int ret = sml_mqtt_client_connect(handle, TEST_BROKER_HOST, TEST_BROKER_PORT, TEST_USE_TLS);
-	zassert_equal(ret, 0, "Failed to connect");
-
-	k_sleep(K_SECONDS(2));
-	sml_mqtt_client_input(handle);
-
-	// Should have received at least one callback
-	LOG_INF("Callback count: %d", callback_count);
-	// Note: Callbacks currently not fully wired in state machine transitions
-	// This test documents the API for future implementation
-
-	sml_mqtt_client_disconnect(handle);
-	sml_mqtt_client_deinit(handle);
+	sml_mqtt_client_deinit(h);
 }

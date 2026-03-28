@@ -475,6 +475,12 @@ public:
 		if (ctx_.connected) {
 			disconnect();
 		}
+		/* Always call mqtt_abort() to release the TCP socket.
+		 * If the Zephyr MQTT state is already IDLE (properly disconnected),
+		 * mqtt_abort() is a no-op.  This handles the case where the client
+		 * goes out of scope mid-connect (e.g. after a test assertion), which
+		 * would otherwise leak the socket file descriptor. */
+		mqtt_abort(&ctx_.client);
 	}
 
 	// Prevent copying

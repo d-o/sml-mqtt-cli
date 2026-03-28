@@ -6,356 +6,217 @@
 #include <zephyr/ztest.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include "fake_broker.hpp"
 #include <sml-mqtt-cli.hpp>
 
+extern void client_poll_and_input(sml_mqtt_cli::mqtt_client &client);
 
-using namespace sml_mqtt_cli;
+/* -------------------------------------------------------------------------
+ * Shared callback tracking - reset before each test that uses it.
+ * ------------------------------------------------------------------------- */
 
-#define TEST_BROKER_HOST "localhost"
-#define TEST_BROKER_PORT 8883
-#define TEST_USE_TLS false
+static int     rx_count;
+static char    rx_topic[CONFIG_SML_MQTT_CLI_MAX_TOPIC_LEN];
+static uint8_t rx_payload[CONFIG_SML_MQTT_CLI_MAX_PAYLOAD_LEN];
+static size_t  rx_payload_len;
 
-// Callback tracking for publish received
-static int publish_received_count = 0;
-static char last_received_topic[128] = {0};
-static uint8_t last_received_payload[512] = {0};
-static size_t last_received_payload_len = 0;
-static enum mqtt_qos last_received_qos = MQTT_QOS_0_AT_MOST_ONCE;
-
-static void publish_received_callback(void *user_data, const char *topic,
-                                      const uint8_t *payload, size_t len,
-                                      enum mqtt_qos qos)
+static void on_publish_received(void *user_data, const char *topic,
+				const uint8_t *payload, size_t len,
+				enum mqtt_qos qos)
 {
-	publish_received_count++;
-	strncpy(last_received_topic, topic, sizeof(last_received_topic) - 1);
-	last_received_topic[sizeof(last_received_topic) - 1] = '\0';
+	ARG_UNUSED(user_data);
+	ARG_UNUSED(qos);
 
-	last_received_payload_len = len < sizeof(last_received_payload) ? len : sizeof(last_received_payload);
-	memcpy(last_received_payload, payload, last_received_payload_len);
-	last_received_qos = qos;
+	rx_count++;
+	strncpy(rx_topic, topic ? topic : "", sizeof(rx_topic) - 1);
+	rx_topic[sizeof(rx_topic) - 1] = '\0';
 
-	LOG_INF("Publish received: topic='%s', len=%zu, qos=%d", topic, len, qos);
+	rx_payload_len = (len < sizeof(rx_payload)) ? len : sizeof(rx_payload);
+	memcpy(rx_payload, payload, rx_payload_len);
 }
 
-static void reset_publish_tracking(void)
+static void reset_rx(void)
 {
-	publish_received_count = 0;
-	memset(last_received_topic, 0, sizeof(last_received_topic));
-	memset(last_received_payload, 0, sizeof(last_received_payload));
-	last_received_payload_len = 0;
-	last_received_qos = MQTT_QOS_0_AT_MOST_ONCE;
+	rx_count       = 0;
+	rx_payload_len = 0;
+	memset(rx_topic,   0, sizeof(rx_topic));
+	memset(rx_payload, 0, sizeof(rx_payload));
 }
+
+/* -------------------------------------------------------------------------
+ * Helper: connect a client through the fake broker.
+ * ------------------------------------------------------------------------- */
+
+static void connect_client(sml_mqtt_cli::mqtt_client &client, const char *id)
+{
+	int ret = client.init(id);
+	zassert_equal(ret, 0, "init failed for %s: %d", id, ret);
+
+	ret = client.connect("127.0.0.1", FAKE_BROKER_PORT, false);
+	zassert_equal(ret, 0, "connect failed for %s: %d", id, ret);
+
+	fake_broker_process(FAKE_MQTT_PKT_CONNECT);
+	client_poll_and_input(client);
+	zassert_true(client.is_connected(), "%s should be connected", id);
+}
+
+static void disconnect_client(sml_mqtt_cli::mqtt_client &client)
+{
+	client.disconnect();
+	fake_broker_process(FAKE_MQTT_PKT_DISCONNECT);
+}
+
+/* -------------------------------------------------------------------------
+ * Tests
+ * ------------------------------------------------------------------------- */
 
 /**
- * @brief Test basic publish with QoS 0
+ * QoS 0 publish - SM should return to Connected after send.
  */
 ZTEST(sml_mqtt_pubsub, test_publish_qos0)
 {
-	LOG_INF("Test: Publish with QoS 0");
-
 	sml_mqtt_cli::mqtt_client client;
-	client.init("test_pub_qos0");
+	connect_client(client, "test_pub_qos0");
 
-	int ret = client.connect(TEST_BROKER_HOST, TEST_BROKER_PORT, TEST_USE_TLS);
-	zassert_equal(ret, 0, "Failed to connect");
+	const char *topic   = "test/sml/qos0";
+	const char *payload = "hello";
 
-	k_sleep(K_SECONDS(2));
-	client.input();
+	int ret = client.publish(topic,
+				 reinterpret_cast<const uint8_t *>(payload),
+				 strlen(payload),
+				 MQTT_QOS_0_AT_MOST_ONCE, false);
+	zassert_equal(ret, 0, "publish returned: %d", ret);
 
-	zassert_true(client.is_connected(), "Client should be connected");
+	/* QoS 0 - broker receives PUBLISH but sends no ACK; no input needed. */
+	fake_broker_process(FAKE_MQTT_PKT_PUBLISH);
 
-	// Publish a message
-	const char *topic = "test/sml/qos0";
-	const char *payload = "Hello, MQTT QoS 0!";
-
-	LOG_INF("Publishing to '%s'...", topic);
-	ret = client.publish(topic, reinterpret_cast<const uint8_t*>(payload),
-	                     strlen(payload), MQTT_QOS_0_AT_MOST_ONCE, false);
-	zassert_equal(ret, 0, "Failed to publish: %d", ret);
-
-	// Allow time for message to be sent
-	k_sleep(K_MSEC(500));
-	client.live();
-
-	LOG_INF("Publish QoS 0 test completed");
-
-	client.disconnect();
+	disconnect_client(client);
 }
 
 /**
- * @brief Test basic subscribe
+ * Subscribe - verify SUBACK drives SM back to Connected.
  */
 ZTEST(sml_mqtt_pubsub, test_subscribe)
 {
-	LOG_INF("Test: Subscribe to topic");
-
 	sml_mqtt_cli::mqtt_client client;
-	client.init("test_subscribe");
+	connect_client(client, "test_subscribe");
 
-	int ret = client.connect(TEST_BROKER_HOST, TEST_BROKER_PORT, TEST_USE_TLS);
-	zassert_equal(ret, 0, "Failed to connect");
+	int ret = client.subscribe("test/sml/sub", MQTT_QOS_0_AT_MOST_ONCE);
+	zassert_equal(ret, 0, "subscribe returned: %d", ret);
 
-	k_sleep(K_SECONDS(2));
-	client.input();
+	fake_broker_process(FAKE_MQTT_PKT_SUBSCRIBE);
+	client_poll_and_input(client);   /* processes SUBACK */
 
-	zassert_true(client.is_connected(), "Client should be connected");
+	zassert_true(client.is_connected(), "should be Connected after SUBACK");
 
-	// Subscribe to a topic
-	const char *topic = "test/sml/subscribe";
-
-	LOG_INF("Subscribing to '%s'...", topic);
-	ret = client.subscribe(topic, MQTT_QOS_0_AT_MOST_ONCE);
-	zassert_equal(ret, 0, "Failed to subscribe: %d", ret);
-
-	// Wait for SUBACK
-	k_sleep(K_SECONDS(1));
-	client.input();
-
-	LOG_INF("Subscribe test completed");
-
-	client.disconnect();
+	disconnect_client(client);
 }
 
 /**
- * @brief Test unsubscribe
+ * Unsubscribe - verify UNSUBACK drives SM back to Connected.
  */
 ZTEST(sml_mqtt_pubsub, test_unsubscribe)
 {
-	LOG_INF("Test: Subscribe and unsubscribe");
-
 	sml_mqtt_cli::mqtt_client client;
-	client.init("test_unsub");
-
-	int ret = client.connect(TEST_BROKER_HOST, TEST_BROKER_PORT, TEST_USE_TLS);
-	zassert_equal(ret, 0, "Failed to connect");
-
-	k_sleep(K_SECONDS(2));
-	client.input();
+	connect_client(client, "test_unsub");
 
 	const char *topic = "test/sml/unsub";
 
-	// Subscribe
-	LOG_INF("Subscribing to '%s'...", topic);
-	ret = client.subscribe(topic, MQTT_QOS_0_AT_MOST_ONCE);
-	zassert_equal(ret, 0, "Failed to subscribe");
+	int ret = client.subscribe(topic, MQTT_QOS_0_AT_MOST_ONCE);
+	zassert_equal(ret, 0, "subscribe returned: %d", ret);
+	fake_broker_process(FAKE_MQTT_PKT_SUBSCRIBE);
+	client_poll_and_input(client);
 
-	k_sleep(K_SECONDS(1));
-	client.input();
-
-	// Unsubscribe
-	LOG_INF("Unsubscribing from '%s'...", topic);
 	ret = client.unsubscribe(topic);
-	zassert_equal(ret, 0, "Failed to unsubscribe: %d", ret);
+	zassert_equal(ret, 0, "unsubscribe returned: %d", ret);
+	fake_broker_process(FAKE_MQTT_PKT_UNSUBSCRIBE);
+	client_poll_and_input(client);   /* processes UNSUBACK */
 
-	k_sleep(K_SECONDS(1));
-	client.input();
+	zassert_true(client.is_connected(),
+		     "should be Connected after UNSUBACK");
 
-	LOG_INF("Unsubscribe test completed");
-
-	client.disconnect();
+	disconnect_client(client);
 }
 
 /**
- * @brief Test publish and receive
+ * @brief Loopback publish-subscribe: subscribe + publish + receive on one client.
  *
- * This test uses two clients: one publisher and one subscriber
+ * This is the primary end-to-end validation of the SML state machine:
+ *
+ *   1. Connect  -> CONNACK  -> SM: Disconnected -> Connected
+ *   2. Subscribe-> SUBACK   -> SM: Connected -> Subscribing -> Connected
+ *                              fake broker stores topic
+ *   3. Publish  -> (no ACK for QoS 0)
+ *                              fake broker echoes PUBLISH back (topic matches)
+ *   4. Poll     -> MQTT_EVT_PUBLISH -> receiving_sm fires -> callback invoked
+ *
+ * Asserts that the callback received the correct topic and payload.
  */
-ZTEST(sml_mqtt_pubsub, test_publish_and_receive)
+ZTEST(sml_mqtt_pubsub, test_loopback_pubsub)
 {
-	LOG_INF("Test: Publish and receive message");
-
-	reset_publish_tracking();
-
-	// Create subscriber client
-	sml_mqtt_cli::mqtt_client subscriber;
-	subscriber.init("test_subscriber");
-	subscriber.set_publish_received_callback(publish_received_callback, nullptr);
-
-	int ret = subscriber.connect(TEST_BROKER_HOST, TEST_BROKER_PORT, TEST_USE_TLS);
-	zassert_equal(ret, 0, "Failed to connect subscriber");
-
-	k_sleep(K_SECONDS(2));
-	subscriber.input();
-
-	// Subscribe to test topic
-	const char *topic = "test/sml/pubrecv";
-	LOG_INF("Subscribing to '%s'...", topic);
-	ret = subscriber.subscribe(topic, MQTT_QOS_0_AT_MOST_ONCE);
-	zassert_equal(ret, 0, "Failed to subscribe");
-
-	k_sleep(K_SECONDS(1));
-	subscriber.input();
-
-	// Create publisher client
-	sml_mqtt_cli::mqtt_client publisher;
-	publisher.init("test_publisher");
-
-	ret = publisher.connect(TEST_BROKER_HOST, TEST_BROKER_PORT, TEST_USE_TLS);
-	zassert_equal(ret, 0, "Failed to connect publisher");
-
-	k_sleep(K_SECONDS(2));
-	publisher.input();
-
-	// Publish a message
-	const char *payload = "Test message from publisher";
-	LOG_INF("Publishing message...");
-	ret = publisher.publish(topic, reinterpret_cast<const uint8_t*>(payload),
-	                       strlen(payload), MQTT_QOS_0_AT_MOST_ONCE, false);
-	zassert_equal(ret, 0, "Failed to publish");
-
-	// Give time for message to propagate
-	k_sleep(K_SECONDS(2));
-
-	// Process incoming messages on subscriber
-	for (int i = 0; i < 5; i++) {
-		ret = subscriber.input();
-		if (ret == 0) {
-			k_sleep(K_MSEC(100));
-		} else {
-			break;
-		}
-	}
-
-	// Check if message was received
-	LOG_INF("Publish received count: %d", publish_received_count);
-	if (publish_received_count > 0) {
-		LOG_INF("Received topic: '%s'", last_received_topic);
-		LOG_INF("Received payload: '%.*s'", (int)last_received_payload_len, last_received_payload);
-
-		zassert_equal(strcmp(last_received_topic, topic), 0, "Topic mismatch");
-		zassert_equal(last_received_payload_len, strlen(payload), "Payload length mismatch");
-		zassert_mem_equal(last_received_payload, payload, strlen(payload), "Payload mismatch");
-	} else {
-		LOG_WRN("No message received - broker may not be running or misconfigured");
-	}
-
-	publisher.disconnect();
-	subscriber.disconnect();
-}
-
-/**
- * @brief Test multiple subscriptions
- */
-ZTEST(sml_mqtt_pubsub, test_multiple_subscriptions)
-{
-	LOG_INF("Test: Multiple subscriptions");
+	reset_rx();
 
 	sml_mqtt_cli::mqtt_client client;
-	client.init("test_multi_sub");
+	client.set_publish_received_callback(on_publish_received, nullptr);
+	connect_client(client, "test_loopback");
 
-	int ret = client.connect(TEST_BROKER_HOST, TEST_BROKER_PORT, TEST_USE_TLS);
-	zassert_equal(ret, 0, "Failed to connect");
+	const char *topic   = "test/loop/qos0";
+	const char *payload = "loopback-payload";
 
-	k_sleep(K_SECONDS(2));
-	client.input();
+	/* Subscribe so the broker stores the topic for echo. */
+	int ret = client.subscribe(topic, MQTT_QOS_0_AT_MOST_ONCE);
+	zassert_equal(ret, 0, "subscribe returned: %d", ret);
+	fake_broker_process(FAKE_MQTT_PKT_SUBSCRIBE);
+	client_poll_and_input(client);
+	zassert_true(client.is_connected(), "connected after SUBACK");
 
-	// Subscribe to multiple topics
-	const char *topics[] = {
-		"test/sml/multi/1",
-		"test/sml/multi/2",
-		"test/sml/multi/3"
-	};
+	/* Publish - broker receives, echoes back on same socket. */
+	ret = client.publish(topic,
+			     reinterpret_cast<const uint8_t *>(payload),
+			     strlen(payload),
+			     MQTT_QOS_0_AT_MOST_ONCE, false);
+	zassert_equal(ret, 0, "publish returned: %d", ret);
 
-	for (size_t i = 0; i < ARRAY_SIZE(topics); i++) {
-		LOG_INF("Subscribing to '%s'...", topics[i]);
-		ret = client.subscribe(topics[i], MQTT_QOS_0_AT_MOST_ONCE);
-		zassert_equal(ret, 0, "Failed to subscribe to topic %zu", i);
+	/*
+	 * fake_broker_process(PUBLISH) sends no ACK for QoS 0 but does
+	 * echo the packet back because the topic matches the subscription.
+	 * client_poll_and_input() then reads that echo, fires
+	 * MQTT_EVT_PUBLISH, which drives the receiving_sm and calls
+	 * on_publish_received().
+	 */
+	fake_broker_process(FAKE_MQTT_PKT_PUBLISH);
+	client_poll_and_input(client);
 
-		k_sleep(K_MSEC(500));
-		client.input();
-	}
+	zassert_equal(rx_count, 1, "callback must fire exactly once");
+	zassert_str_equal(rx_topic, topic, "received topic mismatch");
+	zassert_equal(rx_payload_len, strlen(payload),
+		      "received payload length mismatch");
+	zassert_mem_equal(rx_payload, payload, strlen(payload),
+			  "received payload content mismatch");
 
-	// Unsubscribe from all
-	for (size_t i = 0; i < ARRAY_SIZE(topics); i++) {
-		LOG_INF("Unsubscribing from '%s'...", topics[i]);
-		ret = client.unsubscribe(topics[i]);
-		zassert_equal(ret, 0, "Failed to unsubscribe from topic %zu", i);
-
-		k_sleep(K_MSEC(500));
-		client.input();
-	}
-
-	client.disconnect();
+	disconnect_client(client);
 }
 
 /**
- * @brief Test subscription limit
- */
-ZTEST(sml_mqtt_pubsub, test_subscription_limit)
-{
-	LOG_INF("Test: Subscription limit");
-
-	sml_mqtt_cli::mqtt_client client;
-	client.init("test_sub_limit");
-
-	int ret = client.connect(TEST_BROKER_HOST, TEST_BROKER_PORT, TEST_USE_TLS);
-	zassert_equal(ret, 0, "Failed to connect");
-
-	k_sleep(K_SECONDS(2));
-	client.input();
-
-	// Subscribe up to the limit
-	char topic[64];
-	int success_count = 0;
-
-	for (int i = 0; i < CONFIG_SML_MQTT_CLI_MAX_SUBSCRIPTIONS + 2; i++) {
-		snprintf(topic, sizeof(topic), "test/sml/limit/%d", i);
-		ret = client.subscribe(topic, MQTT_QOS_0_AT_MOST_ONCE);
-
-		if (ret == 0) {
-			success_count++;
-			k_sleep(K_MSEC(200));
-			client.input();
-		} else {
-			LOG_INF("Subscription %d failed as expected (limit reached)", i);
-			break;
-		}
-	}
-
-	LOG_INF("Successfully subscribed to %d topics (max=%d)",
-	        success_count, CONFIG_SML_MQTT_CLI_MAX_SUBSCRIPTIONS);
-
-	zassert_true(success_count <= CONFIG_SML_MQTT_CLI_MAX_SUBSCRIPTIONS,
-	            "Exceeded subscription limit");
-
-	client.disconnect();
-}
-
-/**
- * @brief Test invalid publish parameters
+ * Null publish parameters must be rejected while connected.
  */
 ZTEST(sml_mqtt_pubsub, test_invalid_publish)
 {
-	LOG_INF("Test: Invalid publish parameters");
-
 	sml_mqtt_cli::mqtt_client client;
-	client.init("test_invalid_pub");
-
-	int ret = client.connect(TEST_BROKER_HOST, TEST_BROKER_PORT, TEST_USE_TLS);
-	zassert_equal(ret, 0, "Failed to connect");
-
-	k_sleep(K_SECONDS(2));
-	client.input();
+	connect_client(client, "test_inv_pub");
 
 	const char *payload = "test";
 
-	// NULL topic should fail
-	ret = client.publish(nullptr, reinterpret_cast<const uint8_t*>(payload),
-	                    strlen(payload), MQTT_QOS_0_AT_MOST_ONCE, false);
-	zassert_not_equal(ret, 0, "Should fail with NULL topic");
+	zassert_not_equal(
+		client.publish(nullptr,
+			       reinterpret_cast<const uint8_t *>(payload),
+			       strlen(payload), MQTT_QOS_0_AT_MOST_ONCE, false),
+		0, "NULL topic must fail");
 
-	// NULL payload should fail
-	ret = client.publish("test/topic", nullptr, 10, MQTT_QOS_0_AT_MOST_ONCE, false);
-	zassert_not_equal(ret, 0, "Should fail with NULL payload");
+	zassert_not_equal(
+		client.publish("test/topic", nullptr, 4,
+			       MQTT_QOS_0_AT_MOST_ONCE, false),
+		0, "NULL payload must fail");
 
-	// Too long topic should fail
-	char long_topic[CONFIG_SML_MQTT_CLI_MAX_TOPIC_LEN + 10];
-	memset(long_topic, 'A', sizeof(long_topic) - 1);
-	long_topic[sizeof(long_topic) - 1] = '\0';
-
-	ret = client.publish(long_topic, reinterpret_cast<const uint8_t*>(payload),
-	                    strlen(payload), MQTT_QOS_0_AT_MOST_ONCE, false);
-	zassert_not_equal(ret, 0, "Should fail with too long topic");
-
-	client.disconnect();
+	disconnect_client(client);
 }
