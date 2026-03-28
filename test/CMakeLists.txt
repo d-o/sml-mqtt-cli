@@ -8,6 +8,7 @@ project(sml_mqtt_cli_test)
 
 # Add test source files
 target_sources(app PRIVATE
+	src/fake_broker.cpp
 	src/main.cpp
 	src/test_basic_connection.cpp
 	src/test_publish_subscribe.cpp
