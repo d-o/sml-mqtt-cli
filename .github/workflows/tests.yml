@@ -1,0 +1,109 @@
+# Copyright (c) 2026 Dean Sellers (dean@sellers.id.au)
+# SPDX-License-Identifier: MIT
+#
+# CI: build and run the sml-mqtt-cli unit test suite via west twister.
+#
+# Uses the official Zephyr CI container image which has the Zephyr SDK and
+# all build tools pre-installed.  Only the Zephyr source itself and the
+# Boost.SML module are fetched at run-time; these are cached keyed on the
+# test manifest so a cold run is a one-time cost.
+#
+# The tests use an in-process fake MQTT broker and run entirely inside
+# qemu_riscv32 (CONFIG_NET_TEST + CONFIG_NET_LOOPBACK).  No external
+# broker, no host network access, no Docker-in-Docker.
+#
+# Workspace layout after checkout + init:
+#
+#   $GITHUB_WORKSPACE/
+#   |-- .west/              (west config, points to zephyr as manifest)
+#   |-- zephyr/             (Zephyr RTOS source, fetched by west update)
+#   |-- boost-sml/          (Boost.SML Zephyr module, shallow clone)
+#   `-- sml-mqtt-cli/       (this repository, actions/checkout)
+
+name: Tests
+
+on:
+  push:
+    branches:
+      - main
+      - "feat/**"
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  twister:
+    name: "Twister (qemu_riscv32)"
+    runs-on: ubuntu-22.04
+    container:
+      image: ghcr.io/zephyrproject-rtos/ci:v0.28.6
+      options: '--entrypoint /bin/bash'
+
+    steps:
+      # The runner UID may not match the container UID.  This is a known
+      # GitHub Actions limitation with container jobs.
+      - name: Apply workspace ownership workaround
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      # Check out into sml-mqtt-cli/ so the workspace layout matches the
+      # local T2 development setup.
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          path: sml-mqtt-cli
+
+      # Cache the west workspace (Zephyr source + Boost.SML).
+      # Key is tied to tests/west.yml so a manifest change (new Zephyr
+      # revision, new Boost.SML revision) automatically invalidates it.
+      - name: Cache west workspace
+        id: west-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            .west
+            zephyr
+            boost-sml
+          key: west-v4.3-${{ hashFiles('sml-mqtt-cli/tests/west.yml') }}
+
+      # Populate the cache on a miss.
+      # west init -m zephyr sets up the workspace pointing at Zephyr's
+      # own manifest.  west update zephyr fetches only the Zephyr repo
+      # (not all of Zephyr's hundreds of HAL modules).
+      # boost-sml is a small header-only repo fetched separately.
+      - name: Initialise west workspace
+        if: steps.west-cache.outputs.cache-hit != 'true'
+        run: |
+          west init -m https://github.com/zephyrproject-rtos/zephyr \
+            --mr v4.3-branch .
+          west update zephyr
+          git clone --depth 1 --branch zephyr_module \
+            https://github.com/d-o/sml.git boost-sml
+
+      # Run Twister.
+      # -T points at our test suite root (Twister finds testcase.yaml there).
+      # --inline-logs prints build/run output directly in the CI log.
+      # --cmake-args passes ZEPHYR_MODULES so CMake finds boost-sml and
+      # sml-mqtt-cli without a workspace-level west manifest that lists them.
+      # The semicolon in the module list is a CMake path-list separator and
+      # is safe inside a double-quoted shell argument.
+      - name: Run Twister
+        run: |
+          west twister \
+            -T sml-mqtt-cli/tests \
+            -p qemu_riscv32 \
+            --inline-logs \
+            --cmake-args="-DZEPHYR_MODULES=${GITHUB_WORKSPACE}/boost-sml;${GITHUB_WORKSPACE}/sml-mqtt-cli"
+
+      # Always upload the full Twister output directory so failures can be
+      # diagnosed from the build log and test XML even when --inline-logs
+      # output has been truncated by GitHub's log size limit.
+      - name: Upload Twister artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: twister-${{ github.run_number }}
+          path: twister-out/
+          retention-days: 30

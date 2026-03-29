@@ -1,0 +1,33 @@
+# Copyright (c) 2026 Dean Sellers (dean@sellers.id.au)
+# SPDX-License-Identifier: MIT
+#
+# Twister test descriptor for the sml-mqtt-cli unit test suite.
+#
+# To run via Twister in a configured T2 workspace:
+#
+#   west twister -T sml-mqtt-cli/test \
+#     -p qemu_riscv32 \
+#     --cmake-args="-DZEPHYR_MODULES=$PWD/boost-sml;$PWD/sml-mqtt-cli"
+#
+# To run directly (quicker for development):
+#
+#   west build -p always -s sml-mqtt-cli/test -b qemu_riscv32 \
+#     -- -DZEPHYR_MODULES="$PWD/boost-sml;$PWD/sml-mqtt-cli"
+#   timeout 120 west build -t run
+#
+# Note on platform: qemu_riscv32 is the only supported platform because
+# the tests rely on CONFIG_NET_TEST + CONFIG_NET_LOOPBACK which creates
+# an entirely in-kernel TCP/IP stack.  native_sim (with CONFIG_NET_NATIVE)
+# is also feasible but not yet validated.
+
+tests:
+  libraries.sml_mqtt_cli.unit:
+    harness: ztest
+    harness_config:
+      type: one_line
+      regex:
+        - "PROJECT EXECUTION SUCCESSFUL"
+    platform_allow: qemu_riscv32
+    tags: mqtt sml networking ztest
+    timeout: 120
+    min_ram: 64
