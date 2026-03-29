@@ -83,35 +83,65 @@ choice for a library that targets embedded hardware.
 
 ---
 
-## Building Tests
+## Running Tests
 
-### Option 1: In an Existing Workspace
+### Recommended: west twister (matches CI)
 
-In this workspace (recommended):
+From the workspace root (`z-workspaces/`):
 
 ```bash
-cd /path/to/workspace          # the z-workspaces root
 source .venv/bin/activate
 
-west build -p always -s sml-mqtt-cli/test -b qemu_riscv32 \
-  -- -DZEPHYR_MODULES="$PWD/boost-sml;$PWD/sml-mqtt-cli"
-
-west build -t run
+west twister \
+  -T sml-mqtt-cli/tests \
+  -p qemu_riscv32 \
+  --inline-logs \
+  -x "ZEPHYR_MODULES=$PWD/boost-sml;$PWD/sml-mqtt-cli"
 ```
 
-The `-DZEPHYR_MODULES` override points CMake at the local copies of
-boost-sml and sml-mqtt-cli without re-running `west update`.
+twister exits 0 on all-pass, non-zero on any failure.  The full JUnit
+XML report is written to `twister-out/twister.xml`.
 
-Standalone (fresh checkout):
+The `-x` flag (`--extra-args`) injects CMake cache entries prefixed with
+`-D`, so `-x ZEPHYR_MODULES=...` is equivalent to `-DZEPHYR_MODULES=...`
+in a direct cmake invocation.  Note: `--cmake-args` is NOT a valid twister
+flag and is silently ignored.
+
+### Alternative: direct west build (faster iteration)
+
+```bash
+source .venv/bin/activate
+
+west build -p always -s sml-mqtt-cli/tests -b qemu_riscv32 \
+  -- -DZEPHYR_MODULES="$PWD/boost-sml;$PWD/sml-mqtt-cli"
+
+timeout 120 west build -t run
+```
+
+### Standalone (fresh checkout)
 
 ```bash
 git clone https://github.com/d-o/sml-mqtt-cli.git
-cd sml-mqtt-cli/test
+cd sml-mqtt-cli/tests
 west init -l .
 west update
 west build -b qemu_riscv32
-west build -t run
+timeout 120 west build -t run
 ```
+
+### Code coverage
+
+Code coverage via gcov instrumentation is **not currently supported** on
+`qemu_riscv32`.  The gcov call-stack overhead overflows several Zephyr
+networking thread stacks (`tcp_work`, `rx_q`) that are fixed at 1-2 KB
+by the kernel configuration.  Bumping individual stacks turns into
+whack-a-mole because the instrumentation touches the entire network
+subsystem, which we do not own.
+
+The correct solution is `native_sim` (unlimited stack, same Zephyr net
+subsystem).  That requires verifying that `CONFIG_NET_TEST` +
+`CONFIG_NET_LOOPBACK` work identically under `native_sim`, which is
+feasible but has not been done yet.  See STATUS.md for roadmap.
 
 ---
 
