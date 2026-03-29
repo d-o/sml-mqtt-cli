@@ -129,6 +129,66 @@ west build -b qemu_riscv32
 timeout 120 west build -t run
 ```
 
+### On real hardware: ESP32-S3
+
+The test suite runs unmodified on `esp32s3_devkitc` (and likely any other
+ESP32-S3 board).  Board-specific overlay files in `tests/boards/` handle
+the two differences from the QEMU target:
+
+- **Stack size**: Xtensa LX7 has larger ABI frames than RISC-V; the TCP
+  work queue stack is bumped from 1 KB to 4 KB.
+- **Console redirect**: The devkit board file routes `zephyr,console` to
+  `uart0` (GPIO43/44 → USB-UART bridge → `ttyUSB0`).  The overlay
+  re-enables the built-in USB-JTAG CDC-ACM device and points the console
+  at it, so output appears on `ttyACM0` over the same cable used to flash.
+
+```bash
+# From the workspace root (z-workspaces/)
+source .venv/bin/activate
+
+# Build (hal_espressif must be in the module list)
+west build -p always -s sml-mqtt-cli/tests -b esp32s3_devkitc/esp32s3/procpu \
+  -- -DZEPHYR_MODULES="$PWD/boost-sml;$PWD/sml-mqtt-cli;$PWD/modules/hal/espressif"
+
+# Flash
+west flash
+
+# Monitor (test output appears on the USB-JTAG ACM port)
+west espressif monitor --port /dev/ttyACM0
+```
+
+Expected output (20/20 pass, ~2 s total):
+
+```
+*** Booting Zephyr OS build v4.3.0 ***
+Running TESTSUITE sml_mqtt_basic
+ PASS - test_c_api_connect        in 0.072 seconds
+ PASS - test_c_api_creation       in 0.011 seconds
+ PASS - test_client_creation      in 0.011 seconds
+ PASS - test_connect_disconnect   in 0.072 seconds
+ PASS - test_invalid_connect      in 0.011 seconds
+ PASS - test_invalid_init         in 0.011 seconds
+TESTSUITE sml_mqtt_basic succeeded
+...
+SUITE PASS - 100.00% [sml_mqtt_basic]:    pass=6  fail=0  skip=0  total=6
+SUITE PASS - 100.00% [sml_mqtt_multiple]: pass=5  fail=0  skip=0  total=5
+SUITE PASS - 100.00% [sml_mqtt_pubsub]:   pass=5  fail=0  skip=0  total=5
+SUITE PASS - 100.00% [sml_mqtt_qos]:      pass=4  fail=0  skip=0  total=4
+PROJECT EXECUTION SUCCESSFUL
+```
+
+Board-specific files:
+
+| File | Purpose |
+|------|---------|
+| `boards/esp32s3_devkitc_procpu.conf` | `NET_TCP_WORKQ_STACK_SIZE=4096`, `SERIAL_ESP32_USB=y` |
+| `boards/esp32s3_devkitc_procpu.overlay` | Re-enable `&usb_serial`, redirect `zephyr,console` to it |
+
+Other ESP32-S3 boards should work by adding equivalent `boards/<board>.conf`
+and `boards/<board>.overlay` files following the same pattern.
+
+---
+
 ### Code coverage
 
 Code coverage via gcov instrumentation is **not currently supported** on

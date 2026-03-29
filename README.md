@@ -10,8 +10,8 @@
 
 ## Status
 
-All 20 unit tests pass on qemu_riscv32 with an in-process fake broker.
-No external MQTT broker, no Docker, no network hardware required.
+All 20 unit tests pass on qemu_riscv32 (CI) and on real ESP32-S3 hardware,
+using an in-process fake broker.  No external MQTT broker or Docker required.
 GitHub Actions CI runs on push and pull request.
 
 The library is in beta: the core implementation and unit tests are complete.
