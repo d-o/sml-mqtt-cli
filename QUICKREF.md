@@ -261,7 +261,7 @@ mosquitto -p 8883 -v
 
 See:
 - `example_usage.cpp` - Standalone example
-- `test/src/test_*.cpp` - Test suite examples
+- `tests/src/test_*.cpp` - Test suite examples
 - `README.md` - Full documentation
 
 ## Support
