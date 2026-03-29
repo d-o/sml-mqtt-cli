@@ -226,5 +226,3 @@ ZTEST(sml_mqtt_multiple, test_rapid_publish)
 
 	disconnect_client(client);
 }
-
-
