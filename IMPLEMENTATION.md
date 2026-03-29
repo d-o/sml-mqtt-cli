@@ -137,14 +137,14 @@ Requires MQTT broker on localhost:8883 for full test pass.
 ### 4. Documentation
 
 - **[README.md](README.md)** - Complete library documentation
-- **[test/README.md](test/README.md)** - Test suite documentation
+- **[tests/README.md](tests/README.md)** - Test suite documentation
 - **[example_usage.cpp](example_usage.cpp)** - Standalone example application
 
 ### 5. Build Integration
 
 - **[zephyr/CMakeLists.txt](zephyr/CMakeLists.txt)** - Zephyr build integration
 - **[zephyr/module.yaml](zephyr/module.yaml)** - Module metadata
-- **[test/west.yml](test/west.yml)** - Test project manifest
+- **[tests/west.yml](tests/west.yml)** - Test project manifest
 
 ## Key Design Decisions
 

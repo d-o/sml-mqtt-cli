@@ -1,17 +1,22 @@
 # A zephyr module implementing an MQTT client in C++ using boost::sml
 
-[![Status](https://img.shields.io/badge/status-experimental-orange)](STATUS.md)
+[![Tests](https://github.com/d-o/sml-mqtt-cli/actions/workflows/tests.yml/badge.svg)](https://github.com/d-o/sml-mqtt-cli/actions/workflows/tests.yml)
+[![Status](https://img.shields.io/badge/status-beta-yellow)](STATUS.md)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE.md)
 [![Zephyr](https://img.shields.io/badge/zephyr-4.3+-blue)](https://zephyrproject.org)
 [![C++](https://img.shields.io/badge/c%2B%2B-17-blue)](https://isocpp.org)
 
-**[Status & Roadmap](STATUS.md)** | **[API Reference](QUICKREF.md)** | **[Implementation Details](IMPLEMENTATION.md)** | **[Testing Guide](test/README.md)**
+**[Status & Roadmap](STATUS.md)** | **[API Reference](QUICKREF.md)** | **[Implementation Details](IMPLEMENTATION.md)** | **[Testing Guide](tests/README.md)**
 
-## WARNING: Experimental - Not Production Ready
+## Status
 
-**This library is in early alpha development.** While the core implementation is complete, it has not undergone sufficient testing for production use. Only basic unit tests are passing; integration tests require MQTT broker setup and real hardware validation.
+All 20 unit tests pass on qemu_riscv32 with an in-process fake broker.
+No external MQTT broker, no Docker, no network hardware required.
+GitHub Actions CI runs on push and pull request.
 
-**Do not use in production systems without thorough testing and validation.**
+The library is in beta: the core implementation and unit tests are complete.
+Real-broker integration tests and field deployment are planned for 0.2.0 validation
+(see [STATUS.md](STATUS.md)).
 
 ## Overview
 
@@ -29,22 +34,18 @@ An experimental MQTT client library for Zephyr RTOS that uses Boost.SML (State M
 
 ## Testing Status
 
-PASSING (4 tests):
-- Object creation and initialization
-- Invalid parameter handling
-- C API wrapper functionality
+20/20 unit tests passing on qemu_riscv32 (no external broker required):
 
-FAILING (19 tests - require broker):
-- Connection establishment
-- Publish/Subscribe operations
-- QoS level handling
-- Multiple client scenarios
+| Suite | Tests | Coverage |
+|-------|-------|----------|
+| sml_mqtt_basic | 6/6 | Object creation, init, connect/disconnect, C API |
+| sml_mqtt_pubsub | 5/5 | QoS 0 publish, subscribe, unsubscribe, loopback pubsub |
+| sml_mqtt_qos | 4/4 | QoS 1 PUBACK, QoS 2 handshake, subscription levels, retained flag |
+| sml_mqtt_multiple | 5/5 | Sequential clients, reconnection, mixed C/C++ API, keepalive, rapid publish |
 
-UNTESTED:
-- Real hardware deployment
-- Long-term stability
-- Error recovery paths
-- Performance under load
+The highlight is `test_loopback_pubsub`: subscribe to a topic, publish to
+the same topic, verify the `publish_received_cb` fires with the correct
+topic and payload - all on a single client, no external broker, inside QEMU.
 
 ## Architecture
 
@@ -353,15 +354,20 @@ Reduce footprint by adjusting Kconfig options based on your needs.
 
 ## Testing
 
-Comprehensive test suite included in `test/` directory. See [test/README.md](test/README.md) for details.
+Comprehensive test suite included in `tests/` directory. See [tests/README.md](tests/README.md) for details.
 
 ```bash
-cd test
-west build -p always -b qemu_x86
-west build -t run
+# From the workspace root (z-workspaces/)
+source .venv/bin/activate
+
+west build -p always -s sml-mqtt-cli/tests -b qemu_riscv32 \
+  -- -DZEPHYR_MODULES="$PWD/boost-sml;$PWD/sml-mqtt-cli"
+
+timeout 120 west build -t run
 ```
 
-Tests require an MQTT broker on `localhost:8883` (configurable).
+Tests run entirely inside QEMU with an in-process fake broker.
+No Mosquitto, no Docker, no host network access needed.
 
 ## State Machine Flows
 
@@ -419,7 +425,7 @@ For QoS 1/2 messages, if acknowledgment sending fails:
 
 ## Examples
 
-See the test suite in `test/src/` for comprehensive examples:
+See the test suite in `tests/src/` for comprehensive examples:
 - `test_basic_connection.cpp`: Connection handling
 - `test_publish_subscribe.cpp`: Pub/sub operations
 - `test_qos_levels.cpp`: QoS 0/1/2 usage
@@ -439,7 +445,7 @@ Contributions welcome! Please ensure:
 - **[STATUS.md](STATUS.md)** - Project status, roadmap, and compatibility matrix
 - **[QUICKREF.md](QUICKREF.md)** - Quick API reference
 - **[IMPLEMENTATION.md](IMPLEMENTATION.md)** - Design decisions and architecture
-- **[test/README.md](test/README.md)** - Testing guide and setup
+- **[tests/README.md](tests/README.md)** - Testing guide and setup
 - **[example_usage.cpp](example_usage.cpp)** - Standalone example application
 
 ## External References
