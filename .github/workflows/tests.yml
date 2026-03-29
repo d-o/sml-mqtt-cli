@@ -34,6 +34,14 @@ on:
 permissions:
   contents: read
 
+# Opt into Node.js 24 for all actions now to silence the Node.js 20 deprecation
+# warning that appears on runners using actions/checkout@v4, actions/cache@v4,
+# and actions/upload-artifact@v4.  These actions all support Node.js 24 and
+# will be forced onto it on June 2, 2026 regardless; opting in early avoids
+# spurious warnings in the CI log.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
 # Cancel any in-progress run for the same branch/PR when a new commit
 # is pushed.  This prevents stale runs from occupying a runner slot and
 # avoids misleading pass/fail status on superseded commits.
