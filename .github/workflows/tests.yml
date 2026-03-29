@@ -101,17 +101,17 @@ jobs:
       # Run Twister.
       # -T points at our test suite root (Twister finds testcase.yaml there).
       # --inline-logs prints build/run output directly in the CI log.
-      # --cmake-args passes ZEPHYR_MODULES so CMake finds boost-sml and
-      # sml-mqtt-cli without a workspace-level west manifest that lists them.
-      # The semicolon in the module list is a CMake path-list separator and
-      # is safe inside a double-quoted shell argument.
+      # -x (--extra-args) injects CMake cache entries, auto-prefixed with -D.
+      # ZEPHYR_MODULES tells CMake where to find the boost-sml and sml-mqtt-cli
+      # modules so Kconfig discovers LIB_BOOST_SML and LIB_SML_MQTT_CLI.
+      # Note: --cmake-args is NOT a valid twister flag; the correct flag is -x.
       - name: Run Twister
         run: |
           west twister \
             -T sml-mqtt-cli/tests \
             -p qemu_riscv32 \
             --inline-logs \
-            --cmake-args="-DZEPHYR_MODULES=${GITHUB_WORKSPACE}/boost-sml;${GITHUB_WORKSPACE}/sml-mqtt-cli"
+            -x "ZEPHYR_MODULES=${GITHUB_WORKSPACE}/boost-sml;${GITHUB_WORKSPACE}/sml-mqtt-cli"
 
       # Always upload the full Twister output directory so failures can be
       # diagnosed from the build log and test XML even when --inline-logs
