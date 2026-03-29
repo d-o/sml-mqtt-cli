@@ -34,6 +34,13 @@ on:
 permissions:
   contents: read
 
+# Cancel any in-progress run for the same branch/PR when a new commit
+# is pushed.  This prevents stale runs from occupying a runner slot and
+# avoids misleading pass/fail status on superseded commits.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   twister:
     name: "Twister (qemu_riscv32)"
