@@ -10,13 +10,12 @@
 
 ## Status
 
-All 20 unit tests pass on qemu_riscv32 (CI) and on real ESP32-S3 hardware,
-using an in-process fake broker.  No external MQTT broker or Docker required.
-GitHub Actions CI runs on push and pull request.
-
-The library is in beta: the core implementation and unit tests are complete.
-Real-broker integration tests and field deployment are planned for 0.2.0 validation
-(see [STATUS.md](STATUS.md)).
+All 22 unit tests pass on qemu_riscv32 (CI), using an in-process fake broker.
+No external MQTT broker or Docker required.
+20/20 also confirmed on real ESP32-S3 hardware (April 3, 2026, before the 2 new regression tests).
+7 integration tests pass on native_sim against a real Mosquitto broker via
+ETH_NATIVE_TAP + NAT routing (no mocking, real TCP/IP).  GitHub Actions CI
+runs on push and pull request.
 
 ## Overview
 
@@ -34,14 +33,16 @@ An experimental MQTT client library for Zephyr RTOS that uses Boost.SML (State M
 
 ## Testing Status
 
-20/20 unit tests passing on qemu_riscv32 (no external broker required):
+22/22 unit tests passing on qemu_riscv32 (CI) (April 7, 2026).
+7/7 integration tests passing on native_sim against real Mosquitto (April 7, 2026).
 
 | Suite | Tests | Coverage |
 |-------|-------|----------|
 | sml_mqtt_basic | 6/6 | Object creation, init, connect/disconnect, C API |
 | sml_mqtt_pubsub | 5/5 | QoS 0 publish, subscribe, unsubscribe, loopback pubsub |
-| sml_mqtt_qos | 4/4 | QoS 1 PUBACK, QoS 2 handshake, subscription levels, retained flag |
+| sml_mqtt_qos | 6/6 | QoS 1/2 handshakes, regression tests for composite SM bug, subscription levels, retained flag |
 | sml_mqtt_multiple | 5/5 | Sequential clients, reconnection, mixed C/C++ API, keepalive, rapid publish |
+| sml_mqtt_integration | 7/7 | Real Mosquitto: connect, QoS 0/1/2, subscribe+receive, multi-QoS, keepalive |
 
 The highlight is `test_loopback_pubsub`: subscribe to a topic, publish to
 the same topic, verify the `publish_received_cb` fires with the correct
@@ -63,72 +64,51 @@ Main SM: Disconnected <-> Connecting <-> Connected
 stateDiagram-v2
     [*] --> Disconnected
 
-    Disconnected --> Connecting: connect
-    Connecting --> Connected: CONNACK (success)
-    Connecting --> Disconnected: CONNACK (fail) / timeout
-
-    Connected --> Disconnected: disconnect
-    Connected --> Connected: PINGRESP (keepalive)
+    Disconnected --> Connecting : connect()
+    Connecting --> Connected : CONNACK [success]
+    Connecting --> Disconnected : CONNACK [fail] / timeout
+    Connected --> Disconnected : disconnect
 
     state publishing_sm {
         [*] --> pub_idle
-        pub_idle --> qos0: publish [QoS 0]
-        qos0 --> pub_idle: sent / error
-
-        pub_idle --> qos1: publish [QoS 1]
-        qos1 --> pub_idle: PUBACK / error
-
-        pub_idle --> qos2: publish [QoS 2]
-        qos2 --> releasing: PUBREC
-        qos2 --> pub_idle: error
-        releasing --> pub_idle: PUBCOMP / error
+        pub_idle --> qos0 : publish [QoS 0]
+        qos0 --> done_pub : sent
+        pub_idle --> qos1 : publish [QoS 1]
+        qos1 --> done_pub : PUBACK
+        pub_idle --> qos2 : publish [QoS 2]
+        qos2 --> releasing : PUBREC
+        releasing --> done_pub : PUBCOMP
+        qos0 --> done_pub : error
+        qos1 --> done_pub : error
+        qos2 --> done_pub : error
+        releasing --> done_pub : error
+        done_pub --> [*]
     }
 
     state receiving_sm {
         [*] --> recv_idle
-        recv_idle --> processing: PUBLISH [QoS 0]
-        processing --> recv_idle: handled
-
-        recv_idle --> acking: PUBLISH [QoS 1]
-        acking --> recv_idle: PUBACK sent / error
-
-        recv_idle --> received: PUBLISH [QoS 2]
-        received --> waiting_rel: PUBREC sent
-        received --> recv_idle: error
-        waiting_rel --> recv_idle: PUBREL, PUBCOMP sent / error
+        recv_idle --> done_recv : PUBLISH [QoS 0/1]
+        recv_idle --> waiting_rel : PUBLISH [QoS 2]
+        waiting_rel --> done_recv : PUBREL
+        waiting_rel --> done_recv : error
+        done_recv --> [*]
     }
 
-    Connected --> publishing_sm: publish event
-    Connected --> receiving_sm: PUBLISH received
+    Connected --> publishing_sm : publish()
+    publishing_sm --> Connected : evt_transaction_done
+    publishing_sm --> Disconnected : disconnect
 
-    Connected --> Subscribing: subscribe
-    Subscribing --> Connected: SUBACK / error
+    Connected --> receiving_sm : PUBLISH received
+    receiving_sm --> Connected : evt_transaction_done
+    receiving_sm --> Disconnected : disconnect
 
-    Connected --> Unsubscribing: unsubscribe
-    Unsubscribing --> Connected: UNSUBACK / error
+    Connected --> Subscribing : subscribe()
+    Subscribing --> Connected : SUBACK / error
+    Subscribing --> Disconnected : disconnect
 
-    publishing_sm --> Disconnected: disconnect
-    receiving_sm --> Disconnected: disconnect
-    Subscribing --> Disconnected: disconnect
-    Unsubscribing --> Disconnected: disconnect
-
-    note right of Connected
-        Main connection state
-        Transitions to submachines
-        for message operations
-    end note
-
-    note right of publishing_sm
-        Handles outgoing messages
-        Each QoS level has its own
-        lifecycle within submachine
-    end note
-
-    note right of receiving_sm
-        Handles incoming messages
-        Symmetric to publishing
-        with QoS-specific states
-    end note
+    Connected --> Unsubscribing : unsubscribe()
+    Unsubscribing --> Connected : UNSUBACK / error
+    Unsubscribing --> Disconnected : disconnect
 ```
 
 ### Hierarchical Architecture
@@ -140,18 +120,21 @@ stateDiagram-v2
 - **Subscribing/Unsubscribing**: Subscription management
 
 **Publishing Submachine (publishing_sm):**
-- **pub_idle**: Ready to publish
-- **qos0**: Fire-and-forget publish (QoS 0)
-- **qos1**: At-least-once publish, waiting for PUBACK (QoS 1)
-- **qos2**: Exactly-once publish, waiting for PUBREC (QoS 2)
+- **idle**: Ready to publish (initial state)
+- **qos0**: QoS 0 publish in progress, waiting for send confirmation
+- **qos1**: QoS 1 publish, waiting for PUBACK from broker
+- **qos2**: QoS 2 publish, waiting for PUBREC from broker
 - **releasing**: QoS 2 release phase, waiting for PUBCOMP
 
+Each path ends at `sml::X` (terminate); the MQTT event handler then fires
+`evt_transaction_done` so the outer SM returns to `Connected`.
+
 **Receiving Submachine (receiving_sm):**
-- **recv_idle**: Ready to receive
-- **processing**: Handling QoS 0 message (no ack)
-- **acking**: Handling QoS 1 message, sending PUBACK
-- **received**: Handling QoS 2 message, sending PUBREC
-- **waiting_rel**: QoS 2 waiting for PUBREL, will send PUBCOMP
+- **idle**: Ready to receive (initial state)
+- **waiting_rel**: QoS 2 only — waiting for PUBREL from broker (will send PUBCOMP)
+
+QoS 0 and QoS 1 incoming messages complete immediately at `sml::X` without
+intermediate states; only QoS 2 requires the `waiting_rel` intermediate state.
 
 **Key Benefits:**
 1. Each message type has its own lifecycle in dedicated submachine
@@ -161,8 +144,9 @@ stateDiagram-v2
 5. Error recovery isolated within each submachine
 ## Project Status
 
-**Current Version:** 1.0.0 (March 2026)
-**Status:** Production Ready
+**Current Version:** 0.2.0-beta (April 2026)
+**Status:** Beta - 22/22 unit tests passing on qemu_riscv32 (CI);
+7/7 integration tests passing on native_sim against real Mosquitto broker
 
 See [STATUS.md](STATUS.md) for:
 - Development history and timeline
@@ -172,7 +156,7 @@ See [STATUS.md](STATUS.md) for:
 - Known issues and workarounds
 ## License
 
-Copyright (c) 2025 Dean Sellers (dean@sellers.id.au)
+Copyright (c) 2026 sml-mqtt-cli contributors
 SPDX-License-Identifier: MIT
 
 
@@ -357,34 +341,38 @@ Reduce footprint by adjusting Kconfig options based on your needs.
 Comprehensive test suite included in `tests/` directory. See [tests/README.md](tests/README.md) for details.
 
 ```bash
-# From the workspace root (z-workspaces/)
+# Unit tests - QEMU (no broker required)
 source .venv/bin/activate
-
 west build -p always -s sml-mqtt-cli/tests -b qemu_riscv32 \
   -- -DZEPHYR_MODULES="$PWD/boost-sml;$PWD/sml-mqtt-cli"
-
 timeout 120 west build -t run
+
+# Integration tests - native_sim against a real Mosquitto broker
+west build -p always -s sml-mqtt-cli/tests -b native_sim \
+  -- -DSML_MQTT_TEST_BROKER_HOST=<broker-ip>
+sml-mqtt-cli/tests/scripts/run_integration_tests.sh \
+  --broker-host <broker-ip> --enable-routing --no-local-broker
 ```
 
-Tests run entirely inside QEMU with an in-process fake broker.
+Unit tests run entirely inside QEMU with an in-process fake broker.
 No Mosquitto, no Docker, no host network access needed.
+Integration tests use `native_sim` + `ETH_NATIVE_TAP`; see `tests/README.md`.
 
 ## State Machine Flows
 
-The library implements these state transition flows:
+The library implements these state transition flows.  Publishing and receiving use
+Boost.SML composite submachines; the outer SM re-enters `Connected` via a synthetic
+`evt_transaction_done` event fired by the MQTT event handler after each terminal step.
 
 - **Connection**: Disconnected -> Connecting -> Connected
-- **Publishing QoS 0**: Connected -> Publishing_QoS0 -> Connected
-- **Publishing QoS 1**: Connected -> Publishing_QoS1 -> [receive PUBACK] -> Connected
-- **Publishing QoS 2**: Connected -> Publishing_QoS2 -> [receive PUBREC] -> PubRel_Sent -> [receive PUBCOMP] -> Connected
-- **Receiving QoS 0**: Connected -> [handle message] -> Connected (internal transition)
-- **Receiving QoS 1**: Connected -> [handle message, send PUBACK] -> Connected (internal transition)
-- **Receiving QoS 2**: Connected -> [receive PUBLISH, send PUBREC] -> PubRec_Sent_Rx -> [receive PUBREL, send PUBCOMP] -> Connected
+- **Publishing QoS 0**: Connected -> publishing_sm (idle->qos0->X) -> Connected
+- **Publishing QoS 1**: Connected -> publishing_sm (idle->qos1->[PUBACK]->X) -> Connected
+- **Publishing QoS 2**: Connected -> publishing_sm (idle->qos2->[PUBREC]->releasing->[PUBCOMP]->X) -> Connected
+- **Receiving QoS 0/1**: Connected -> receiving_sm (idle->X) -> Connected
+- **Receiving QoS 2**: Connected -> receiving_sm (idle->waiting_rel->[PUBREL]->X) -> Connected
 - **Subscribing**: Connected -> Subscribing -> [receive SUBACK] -> Connected
 - **Unsubscribing**: Connected -> Unsubscribing -> [receive UNSUBACK] -> Connected
-- **Error Recovery**: All intermediate states -> [send_error] -> Connected
-
-**Note:** QoS 0/1 receiving uses internal transitions (no state changes) because these are single-step operations that complete immediately. Only QoS 2 (exactly-once delivery) requires multi-step acknowledgment flows with intermediate states. Publishing operations all have explicit states because we initiate them and need to track our own protocol state through completion.
+- **Error Recovery**: Sub-SM intermediate states -> [evt_send_error]->X -> evt_transaction_done -> Connected
 
 ## Error Handling
 

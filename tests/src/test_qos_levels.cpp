@@ -3,6 +3,38 @@
  * SPDX-License-Identifier: MIT
  */
 
+/*
+ * test_qos_levels.cpp — QoS lifecycle and regression tests
+ *
+ * What we are verifying
+ * ---------------------
+ * The mqtt_client uses a Boost.SML composite state machine.  "Connected" has
+ * two composite sub-states: publishing_sm and receiving_sm.  Each sub-SM runs
+ * its QoS handshake internally and, when the final ACK arrives, signals
+ * completion to the outer SM via evt_transaction_done so the outer SM can
+ * return to "Connected".
+ *
+ * The regression tests (test_publish_qosN_then_subscribe) specifically guard
+ * against a bug where the outer SM became permanently stuck inside
+ * publishing_sm after any publish.  The symptom was that a subsequent
+ * subscribe() call was silently dropped because the "Connected + evt_subscribe"
+ * transition was unreachable while the SM remained inside the composite state.
+ *
+ * What a failure looks like
+ * -------------------------
+ * If evt_transaction_done is not fired (or not handled) after a publish
+ * completes, get_state() returns the innermost sub-SM state ("qos1",
+ * "releasing", etc.) instead of "Connected", and the subscribe() call returns
+ * 0 but the MQTT SUBSCRIBE packet is never sent — the fake broker never sees
+ * it and client_poll_and_input() returns without driving the SM to Connected.
+ * The zassert_str_equal("Connected") assertions catch both failure modes.
+ *
+ * Test interaction pattern (deterministic, no k_sleep)
+ * ------------------------------------------------------
+ *   fake_broker_process(FAKE_MQTT_PKT_X)  — broker receives packet, sends reply
+ *   client_poll_and_input(client)          — client reads reply, drives SM
+ */
+
 #include <zephyr/ztest.h>
 #include <zephyr/kernel.h>
 #include "fake_broker.hpp"
@@ -57,6 +89,8 @@ ZTEST(sml_mqtt_qos, test_publish_qos1)
 	client_poll_and_input(client);
 
 	zassert_true(client.is_connected(), "still connected after PUBACK");
+	zassert_str_equal(client.get_state(), "Connected",
+			  "SM must return to Connected after PUBACK");
 
 	disconnect_client(client);
 }
@@ -90,6 +124,77 @@ ZTEST(sml_mqtt_qos, test_publish_qos2)
 	client_poll_and_input(client);
 
 	zassert_true(client.is_connected(), "still connected after PUBCOMP");
+	zassert_str_equal(client.get_state(), "Connected",
+			  "SM must return to Connected after PUBCOMP");
+
+	disconnect_client(client);
+}
+
+/**
+ * QoS 1 publish followed by subscribe on the same connection.
+ *
+ * Exposes the bug where the SM gets permanently stuck inside publishing_sm
+ * after the first publish: a subsequent subscribe would be silently dropped
+ * because the "Connected" + evt_subscribe transition is unreachable.
+ */
+ZTEST(sml_mqtt_qos, test_publish_qos1_then_subscribe)
+{
+	sml_mqtt_cli::mqtt_client client;
+	connect_client(client, "test_q1_sub");
+
+	int ret = client.publish("test/q1/then/sub",
+				 reinterpret_cast<const uint8_t *>("hi"), 2,
+				 MQTT_QOS_1_AT_LEAST_ONCE, false);
+	zassert_equal(ret, 0, "QoS 1 publish failed: %d", ret);
+
+	fake_broker_process(FAKE_MQTT_PKT_PUBLISH);  /* broker sends PUBACK */
+	client_poll_and_input(client);               /* client processes PUBACK */
+
+	zassert_str_equal(client.get_state(), "Connected",
+			  "SM must be Connected after PUBACK before subscribe");
+
+	/* Subscribe must succeed - silently dropped if SM stuck in publishing_sm */
+	ret = client.subscribe("test/q1/then/sub", MQTT_QOS_0_AT_MOST_ONCE);
+	zassert_equal(ret, 0, "subscribe after QoS 1 publish failed: %d", ret);
+
+	fake_broker_process(FAKE_MQTT_PKT_SUBSCRIBE);
+	client_poll_and_input(client);
+
+	zassert_str_equal(client.get_state(), "Connected",
+			  "SM must be Connected after SUBACK");
+
+	disconnect_client(client);
+}
+
+/**
+ * QoS 2 publish followed by subscribe on the same connection.
+ */
+ZTEST(sml_mqtt_qos, test_publish_qos2_then_subscribe)
+{
+	sml_mqtt_cli::mqtt_client client;
+	connect_client(client, "test_q2_sub");
+
+	int ret = client.publish("test/q2/then/sub",
+				 reinterpret_cast<const uint8_t *>("hi"), 2,
+				 MQTT_QOS_2_EXACTLY_ONCE, false);
+	zassert_equal(ret, 0, "QoS 2 publish failed: %d", ret);
+
+	fake_broker_process(FAKE_MQTT_PKT_PUBLISH);   /* PUBREC */
+	client_poll_and_input(client);
+	fake_broker_process(FAKE_MQTT_PKT_PUBREL);    /* PUBCOMP */
+	client_poll_and_input(client);
+
+	zassert_str_equal(client.get_state(), "Connected",
+			  "SM must be Connected after PUBCOMP before subscribe");
+
+	ret = client.subscribe("test/q2/then/sub", MQTT_QOS_0_AT_MOST_ONCE);
+	zassert_equal(ret, 0, "subscribe after QoS 2 publish failed: %d", ret);
+
+	fake_broker_process(FAKE_MQTT_PKT_SUBSCRIBE);
+	client_poll_and_input(client);
+
+	zassert_str_equal(client.get_state(), "Connected",
+			  "SM must be Connected after SUBACK");
 
 	disconnect_client(client);
 }

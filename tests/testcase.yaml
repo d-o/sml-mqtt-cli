@@ -1,24 +1,32 @@
 # Copyright (c) 2026 Dean Sellers (dean@sellers.id.au)
 # SPDX-License-Identifier: MIT
 #
-# Twister test descriptor for the sml-mqtt-cli unit test suite.
+# Twister test descriptor for the sml-mqtt-cli test suite.
 #
-# To run via Twister in a configured T2 workspace:
+# Two test variants:
 #
-#   west twister -T sml-mqtt-cli/test \
-#     -p qemu_riscv32 \
-#     --cmake-args="-DZEPHYR_MODULES=$PWD/boost-sml;$PWD/sml-mqtt-cli"
+#   libraries.sml_mqtt_cli.unit (qemu_riscv32)
+#     20 unit tests using the in-process fake broker + Zephyr loopback.
+#     No external broker, no network hardware, no root required.
 #
-# To run directly (quicker for development):
+#     west twister -T sml-mqtt-cli/tests -p qemu_riscv32 \
+#       --cmake-args="-DZEPHYR_MODULES=$PWD/boost-sml;$PWD/sml-mqtt-cli"
 #
-#   west build -p always -s sml-mqtt-cli/test -b qemu_riscv32 \
-#     -- -DZEPHYR_MODULES="$PWD/boost-sml;$PWD/sml-mqtt-cli"
-#   timeout 120 west build -t run
+#   libraries.sml_mqtt_cli.integration (native_sim)
+#     7 integration tests against a real Mosquitto broker via TAP Ethernet.
+#     Requires the setup script to be run first (needs root for ip tuntap):
 #
-# Note on platform: qemu_riscv32 is the only supported platform because
-# the tests rely on CONFIG_NET_TEST + CONFIG_NET_LOOPBACK which creates
-# an entirely in-kernel TCP/IP stack.  native_sim (with CONFIG_NET_NATIVE)
-# is also feasible but not yet validated.
+#       sudo sml-mqtt-cli/tests/scripts/run_integration_tests.sh --setup-only
+#
+#     Then run with Twister:
+#       west twister -T sml-mqtt-cli/tests \
+#         -p native_sim --test libraries.sml_mqtt_cli.integration \
+#         --cmake-args="-DZEPHYR_MODULES=$PWD/boost-sml;$PWD/sml-mqtt-cli"
+#
+#     Or directly (quicker during development):
+#       west build -p always -s sml-mqtt-cli/tests -b native_sim \
+#         -- -DZEPHYR_MODULES="$PWD/boost-sml;$PWD/sml-mqtt-cli"
+#       sudo ./build/zephyr/zephyr.exe
 
 tests:
   libraries.sml_mqtt_cli.unit:
@@ -29,5 +37,22 @@ tests:
         - "PROJECT EXECUTION SUCCESSFUL"
     platform_allow: qemu_riscv32
     tags: mqtt sml networking ztest
+    timeout: 120
+    min_ram: 64
+
+  libraries.sml_mqtt_cli.integration:
+    harness: ztest
+    harness_config:
+      type: one_line
+      regex:
+        - "PROJECT EXECUTION SUCCESSFUL"
+    platform_allow: native_sim
+    tags: mqtt sml networking ztest integration
+    # Broker address is compiled in via -DSML_MQTT_TEST_BROKER_HOST=<ip>.
+    # Default (no override): 192.0.2.1 (host-side TAP, local Mosquitto).
+    # LAN / remote: rebuild with the real broker IP, then run the script
+    # with --enable-routing --no-local-broker.
+    # See tests/scripts/run_integration_tests.sh --help for all use cases.
+    filter: dt_compat_enabled("zephyr,posix")
     timeout: 120
     min_ram: 64

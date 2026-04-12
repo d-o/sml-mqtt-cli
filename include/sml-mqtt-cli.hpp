@@ -147,6 +147,13 @@ struct evt_publish_received {
 
 struct evt_pingresp {} __attribute__((packed));
 
+// Synthetic completion signal fired via back::process from within a sub-SM action
+// when a publish or receive transaction reaches its terminal step (sml::X).
+// The outer SM listens for this on sml::state<publishing_sm> and
+// sml::state<receiving_sm> to transition back to "Connected".
+// It is an internal event — never fire it directly from application code.
+struct evt_transaction_done {} __attribute__((packed));
+
 // ============================================================================
 // Context - holds all client state and buffers
 // ============================================================================
@@ -207,133 +214,150 @@ struct mqtt_context {
 // State Machine Definition - Hierarchical/Composite Architecture
 // ============================================================================
 
-// Publishing submachine - handles outgoing publish message lifecycle
+// ============================================================================
+// Publishing sub-machine
+//
+// Encapsulates the full outgoing publish lifecycle for all three QoS levels.
+// Each terminal transition goes to sml::X.  The MQTT event handler (or the
+// publish() method for QoS 0) fires evt_transaction_done immediately after
+// the terminal process_event() call.  At that point the inner SM is at X and
+// cannot handle any events, so evt_transaction_done falls through to the outer
+// SM which transitions back to "Connected".
+//
+// QoS 0:  idle ──evt_publish──► qos0 ──evt_publish_sent──► X
+// QoS 1:  idle ──evt_publish──► qos1 ──evt_puback────────► X
+// QoS 2:  idle ──evt_publish──► qos2 ──evt_pubrec─────► releasing ──evt_pubcomp──► X
+// Any state ──evt_send_error──► X
+//
+// After each ──► X the caller fires: sm_.process_event(evt_transaction_done{})
+// ============================================================================
 struct publishing_sm {
 	auto operator()() const noexcept {
 		using namespace sml;
 
-		// Guards for QoS level
 		auto is_qos0 = [](const evt_publish& evt) noexcept -> bool {
 			return evt.qos == MQTT_QOS_0_AT_MOST_ONCE;
 		};
-
 		auto is_qos1 = [](const evt_publish& evt) noexcept -> bool {
 			return evt.qos == MQTT_QOS_1_AT_LEAST_ONCE;
 		};
-
 		auto is_qos2 = [](const evt_publish& evt) noexcept -> bool {
 			return evt.qos == MQTT_QOS_2_EXACTLY_ONCE;
 		};
 
-		// Actions
-		auto send_publish = [](mqtt_context& ctx, const evt_publish& evt) noexcept {
+		auto send_publish = [](mqtt_context& ctx, const evt_publish&) noexcept {
 			ctx.pending_message_id = ctx.next_message_id++;
 		};
 
+		// QoS 0 complete: packet accepted by the stack.
 		auto on_publish_sent = [](mqtt_context& ctx) noexcept {
 			ctx.pending_message_id = 0;
 		};
 
-		auto handle_puback = [](mqtt_context& ctx, const evt_puback& evt) noexcept {
+		// QoS 1 complete: broker acknowledged delivery.
+		auto handle_puback = [](mqtt_context& ctx, const evt_puback&) noexcept {
 			ctx.pending_message_id = 0;
 		};
 
-		auto send_pubrel = [](mqtt_context& ctx, const evt_pubrec& evt) noexcept {
-			// QoS 2 flow
-		};
+		// QoS 2 intermediate: PUBREC received.  The actual PUBREL wire send is
+		// done in the MQTT event handler before this SM transition fires.
+		auto send_pubrel = [](mqtt_context&, const evt_pubrec&) noexcept {};
 
-		auto handle_pubcomp = [](mqtt_context& ctx, const evt_pubcomp& evt) noexcept {
+		// QoS 2 complete: broker confirmed exactly-once delivery.
+		auto handle_pubcomp = [](mqtt_context& ctx, const evt_pubcomp&) noexcept {
 			ctx.pending_message_id = 0;
 		};
 
+		// Error in any publish state.  Caller fires evt_transaction_done after.
 		auto log_error = [](mqtt_context& ctx, const evt_send_error& evt) noexcept {
-			LOG_ERR("Send error in publishing: %d (%s)", evt.error_code, evt.operation);
+			LOG_ERR("Publish send error: %d (%s)",
+			        evt.error_code, evt.operation ? evt.operation : "unknown");
+			ctx.pending_message_id = 0;
 		};
 
 		// clang-format off
 		return make_transition_table(
-			// QoS 0 - fire and forget
-			*"idle"_s + event<evt_publish> [is_qos0] / send_publish = "qos0"_s,
-			 "qos0"_s + event<evt_publish_sent> / on_publish_sent = "idle"_s,
-			 "qos0"_s + event<evt_send_error> / log_error = "idle"_s,
+			*"idle"_s      + event<evt_publish> [is_qos0] / send_publish      = "qos0"_s,
+			 "qos0"_s      + event<evt_publish_sent>      / on_publish_sent   = sml::X,
+			 "qos0"_s      + event<evt_send_error>        / log_error         = sml::X,
 
-			// QoS 1 - at least once
-			 "idle"_s + event<evt_publish> [is_qos1] / send_publish = "qos1"_s,
-			 "qos1"_s + event<evt_puback> / handle_puback = "idle"_s,
-			 "qos1"_s + event<evt_send_error> / log_error = "idle"_s,
+			 "idle"_s      + event<evt_publish> [is_qos1] / send_publish      = "qos1"_s,
+			 "qos1"_s      + event<evt_puback>            / handle_puback     = sml::X,
+			 "qos1"_s      + event<evt_send_error>        / log_error         = sml::X,
 
-			// QoS 2 - exactly once
-			 "idle"_s + event<evt_publish> [is_qos2] / send_publish = "qos2"_s,
-			 "qos2"_s + event<evt_pubrec> / send_pubrel = "releasing"_s,
-			 "qos2"_s + event<evt_send_error> / log_error = "idle"_s,
-			 "releasing"_s + event<evt_pubcomp> / handle_pubcomp = "idle"_s,
-			 "releasing"_s + event<evt_send_error> / log_error = "idle"_s
+			 "idle"_s      + event<evt_publish> [is_qos2] / send_publish      = "qos2"_s,
+			 "qos2"_s      + event<evt_pubrec>            / send_pubrel       = "releasing"_s,
+			 "qos2"_s      + event<evt_send_error>        / log_error         = sml::X,
+			 "releasing"_s + event<evt_pubcomp>           / handle_pubcomp    = sml::X,
+			 "releasing"_s + event<evt_send_error>        / log_error         = sml::X
 		);
 		// clang-format on
 	}
 };
 
-// Receiving submachine - handles incoming publish message lifecycle
+// ============================================================================
+// Receiving sub-machine
+//
+// Encapsulates the full incoming publish lifecycle for all three QoS levels.
+// The actual wire-level ACK sends (PUBACK, PUBREC, PUBCOMP) are performed
+// directly in the MQTT event handler; the SM actions handle bookkeeping only.
+// Each terminal transition goes to sml::X; the event handler fires
+// evt_transaction_done after the terminal process_event() call.
+//
+// QoS 0:  idle ──evt_publish_received──► X          [no ACK required]
+// QoS 1:  idle ──evt_publish_received──► X          [PUBACK sent by event handler]
+// QoS 2:  idle ──evt_publish_received──► waiting_rel ──evt_pubrel──► X
+//                                             └──evt_send_error───► X
+//
+// After each ──► X the caller fires: sm_.process_event(evt_transaction_done{})
+// ============================================================================
 struct receiving_sm {
 	auto operator()() const noexcept {
 		using namespace sml;
 
-		// Guards for QoS level
 		auto is_qos0 = [](const evt_publish_received& evt) noexcept -> bool {
 			return evt.qos == MQTT_QOS_0_AT_MOST_ONCE;
 		};
-
 		auto is_qos1 = [](const evt_publish_received& evt) noexcept -> bool {
 			return evt.qos == MQTT_QOS_1_AT_LEAST_ONCE;
 		};
-
 		auto is_qos2 = [](const evt_publish_received& evt) noexcept -> bool {
 			return evt.qos == MQTT_QOS_2_EXACTLY_ONCE;
 		};
 
-		// Actions
-		auto handle_message = [](mqtt_context& ctx, const evt_publish_received& evt) noexcept {
+		// Store incoming message context.  Shared by all QoS levels.
+		// For QoS 0/1: caller fires evt_transaction_done right after this.
+		// For QoS 1:   PUBACK was already sent by the event handler before
+		//              process_event(pub_evt) was called.
+		// For QoS 2:   PUBREC was already sent; we wait for evt_pubrel next.
+		auto handle_message = [](mqtt_context& ctx,
+		                         const evt_publish_received& evt) noexcept {
 			if (evt.topic) {
-				strncpy(ctx.current_topic.data(), evt.topic, ctx.current_topic.size() - 1);
+				strncpy(ctx.current_topic.data(), evt.topic,
+				        ctx.current_topic.size() - 1);
 				ctx.current_topic[ctx.current_topic.size() - 1] = '\0';
 			}
 			ctx.pending_message_id = evt.message_id;
 		};
 
-		auto send_puback = [](mqtt_context& ctx) noexcept {
-			// Send PUBACK for QoS 1
-		};
-
-		auto send_pubrec = [](mqtt_context& ctx) noexcept {
-			// Send PUBREC for QoS 2
-		};
-
-		auto send_pubcomp = [](mqtt_context& ctx, const evt_pubrel& evt) noexcept {
-			// Send PUBCOMP for QoS 2
+		// QoS 2 complete: PUBREL received; PUBCOMP sent by event handler after.
+		auto on_pubrel = [](mqtt_context& ctx, const evt_pubrel&) noexcept {
 			ctx.pending_message_id = 0;
 		};
 
-		auto log_error = [](mqtt_context& ctx, const evt_send_error& evt) noexcept {
-			LOG_ERR("Send error in receiving: %d (%s)", evt.error_code, evt.operation);
+		// Error in any receive state.  Caller fires evt_transaction_done after.
+		auto log_error = [](mqtt_context&, const evt_send_error& evt) noexcept {
+			LOG_ERR("Receive error: %d (%s)",
+			        evt.error_code, evt.operation ? evt.operation : "unknown");
 		};
 
 		// clang-format off
 		return make_transition_table(
-			// QoS 0 - no acknowledgment
-			*"idle"_s + event<evt_publish_received> [is_qos0] / handle_message = "processing"_s,
-			 "processing"_s / [] {} = "idle"_s,
-
-			// QoS 1 - acknowledge with PUBACK
-			 "idle"_s + event<evt_publish_received> [is_qos1] / handle_message = "acking"_s,
-			 "acking"_s / send_puback = "idle"_s,
-			 "acking"_s + event<evt_send_error> / log_error = "idle"_s,
-
-			// QoS 2 - four-way handshake
-			 "idle"_s + event<evt_publish_received> [is_qos2] / handle_message = "received"_s,
-			 "received"_s / send_pubrec = "waiting_rel"_s,
-			 "received"_s + event<evt_send_error> / log_error = "idle"_s,
-			 "waiting_rel"_s + event<evt_pubrel> / send_pubcomp = "idle"_s,
-			 "waiting_rel"_s + event<evt_send_error> / log_error = "idle"_s
+			*"idle"_s        + event<evt_publish_received> [is_qos0] / handle_message = sml::X,
+			 "idle"_s        + event<evt_publish_received> [is_qos1] / handle_message = sml::X,
+			 "idle"_s        + event<evt_publish_received> [is_qos2] / handle_message = "waiting_rel"_s,
+			 "waiting_rel"_s + event<evt_pubrel>                     / on_pubrel       = sml::X,
+			 "waiting_rel"_s + event<evt_send_error>                 / log_error       = sml::X
 		);
 		// clang-format on
 	}
@@ -430,13 +454,20 @@ struct mqtt_state_machine {
 			"Connecting"_s + event<evt_timeout> [is_timeout] / cleanup_resources = "Disconnected"_s,
 			"Connected"_s + event<evt_disconnect> / on_disconnected = "Disconnected"_s,
 
-			// Publishing - enter submachine, stays there handling events
-			"Connected"_s + event<evt_publish> = sml::state<publishing_sm>,
-			sml::state<publishing_sm> + event<evt_disconnect> / on_disconnected = "Disconnected"_s,
+			// Publishing: enter composite sub-SM on publish.
+			// publishing_sm self-signals evt_transaction_done (via back::process)
+			// when the QoS lifecycle completes; the outer SM listens here to
+			// exit the composite state back to Connected.
+			"Connected"_s + event<evt_publish>                                     = sml::state<publishing_sm>,
+			sml::state<publishing_sm> + event<evt_transaction_done>                = "Connected"_s,
+			sml::state<publishing_sm> + event<evt_disconnect> / on_disconnected    = "Disconnected"_s,
 
-			// Receiving - enter submachine, stays there handling events
-			"Connected"_s + event<evt_publish_received> = sml::state<receiving_sm>,
-			sml::state<receiving_sm> + event<evt_disconnect> / on_disconnected = "Disconnected"_s,
+			// Receiving: enter composite sub-SM on any incoming publish.
+			// receiving_sm self-signals evt_transaction_done when the QoS
+			// lifecycle completes (immediately for QoS 0/1, after PUBREL for QoS 2).
+			"Connected"_s + event<evt_publish_received>                            = sml::state<receiving_sm>,
+			sml::state<receiving_sm>  + event<evt_transaction_done>                = "Connected"_s,
+			sml::state<receiving_sm>  + event<evt_disconnect> / on_disconnected    = "Disconnected"_s,
 
 			// Subscribing
 			"Connected"_s + event<evt_subscribe> / send_subscribe = "Subscribing"_s,
@@ -604,8 +635,8 @@ public:
 
 		int ret = mqtt_publish(&ctx_.client, &param);
 		if (ret == 0 && qos == MQTT_QOS_0_AT_MOST_ONCE) {
-			evt_publish_sent sent = {};
-			sm_.process_event(sent);
+			sm_.process_event(evt_publish_sent{});
+			sm_.process_event(evt_transaction_done{});
 		}
 
 		return ret;
@@ -806,6 +837,12 @@ private:
 			};
 			sm_.process_event(pub_evt);
 
+			// QoS 0/1: receiving_sm reached X; signal completion to outer SM.
+			// QoS 2: inner SM is at "waiting_rel"; we must wait for PUBREL.
+			if (p->message.topic.qos != MQTT_QOS_2_EXACTLY_ONCE) {
+				sm_.process_event(evt_transaction_done{});
+			}
+
 			// Call user callback
 			if (ctx_.publish_received_cb) {
 				ctx_.publish_received_cb(ctx_.user_data, ctx_.current_topic.data(),
@@ -820,8 +857,7 @@ private:
 				ack_ret = mqtt_publish_qos1_ack(&ctx_.client, &ack);
 				if (ack_ret < 0) {
 					LOG_ERR("Failed to send PUBACK: %d", ack_ret);
-					evt_send_error err = {ack_ret, "puback"};
-					sm_.process_event(err);
+					/* SM already returned to Connected; evt_send_error is dropped. */
 				}
 			} else if (p->message.topic.qos == MQTT_QOS_2_EXACTLY_ONCE) {
 				struct mqtt_pubrec_param rec = {p->message_id};
@@ -830,6 +866,7 @@ private:
 					LOG_ERR("Failed to send PUBREC: %d", ack_ret);
 					evt_send_error err = {ack_ret, "pubrec"};
 					sm_.process_event(err);
+					sm_.process_event(evt_transaction_done{});
 				}
 			}
 			break;
@@ -837,6 +874,7 @@ private:
 		case MQTT_EVT_PUBACK: {
 			evt_puback ack = {evt->param.puback.message_id};
 			sm_.process_event(ack);
+			sm_.process_event(evt_transaction_done{});
 			break;
 		}
 		case MQTT_EVT_PUBREC: {
@@ -850,26 +888,29 @@ private:
 				LOG_ERR("Failed to send PUBREL: %d", ret);
 				evt_send_error err = {ret, "pubrel"};
 				sm_.process_event(err);
+				sm_.process_event(evt_transaction_done{});
 			}
+			// Success: inner SM stays at "releasing"; wait for PUBCOMP.
 			break;
 		}
 		case MQTT_EVT_PUBREL: {
 			evt_pubrel rel = {evt->param.pubrel.message_id};
 			sm_.process_event(rel);
+			// receiving_sm reached X; signal completion before sending PUBCOMP.
+			sm_.process_event(evt_transaction_done{});
 
-			// Send PUBCOMP
+			// Send PUBCOMP (SM is now at Connected; a send failure is logged only).
 			struct mqtt_pubcomp_param comp = {evt->param.pubrel.message_id};
 			int ret = mqtt_publish_qos2_complete(&ctx_.client, &comp);
 			if (ret < 0) {
 				LOG_ERR("Failed to send PUBCOMP: %d", ret);
-				evt_send_error err = {ret, "pubcomp"};
-				sm_.process_event(err);
 			}
 			break;
 		}
 		case MQTT_EVT_PUBCOMP: {
 			evt_pubcomp comp = {evt->param.pubcomp.message_id};
 			sm_.process_event(comp);
+			sm_.process_event(evt_transaction_done{});
 			break;
 		}
 		case MQTT_EVT_SUBACK: {

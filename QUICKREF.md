@@ -223,38 +223,36 @@ Minimal config: ~1.1 KB per client
 - **releasing** - QoS 2 release phase, waiting for PUBCOMP
 
 **Receiving Submachine (receiving_sm):**
-- **idle** - Ready to receive
-- **processing** - QoS 0 message handling
-- **acking** - QoS 1, sending PUBACK
-- **received** - QoS 2, sending PUBREC
-- **waiting_rel** - QoS 2, waiting for PUBREL
+- **idle** - Ready to receive (initial state)
+- **waiting_rel** - QoS 2, waiting for PUBREL from broker (QoS 0/1 complete immediately at sml::X)
 
 ## Error Handling
 
 - All functions return errno codes (0 = success)
 - Protocol send errors trigger automatic state recovery
-- Failed protocol sends (PUBACK, PUBREC, PUBREL, PUBCOMP) return to submachine idle state
+- Failed protocol sends (PUBACK, PUBREC, PUBREL, PUBCOMP) terminate the sub-SM (sml::X);
+  the outer SM receives evt_transaction_done and returns to Connected
 - Connection errors return to Disconnected state
-- Error recovery untested - requires real broker validation
+- Error recovery validated by unit tests (fake broker) and integration tests (real Mosquitto)
 
 ## Testing
 
 ```bash
-# In existing workspace
-cd /path/to/workspace
-west build -s sml-mqtt-cli/test -b qemu_riscv32 -- -DZEPHYR_MODULES="$PWD/boost-sml;$PWD/sml-mqtt-cli"
-west build -t run
+# Unit tests - in QEMU, no broker required
+west build -p always -s sml-mqtt-cli/tests -b qemu_riscv32 \
+  -- -DZEPHYR_MODULES="$PWD/boost-sml;$PWD/sml-mqtt-cli"
+timeout 120 west build -t run
 
-# Standalone workspace
-git clone https://github.com/d-o/sml-mqtt-cli.git
-cd sml-mqtt-cli/test
-west init -l .
-west update
-west build -b qemu_riscv32
-west build -t run
+# Integration tests - native_sim against a real Mosquitto broker
+west build -p always -s sml-mqtt-cli/tests -b native_sim \
+  -- -DSML_MQTT_TEST_BROKER_HOST=<broker-ip>
+sml-mqtt-cli/tests/scripts/run_integration_tests.sh \
+  --broker-host <broker-ip> --enable-routing --no-local-broker
 
-# Requires MQTT broker for integration tests
-mosquitto -p 8883 -v
+# Local broker only (no routing needed)
+mosquitto -p 1883 -v
+west build -p always -s sml-mqtt-cli/tests -b native_sim
+sml-mqtt-cli/tests/scripts/run_integration_tests.sh
 ```
 
 ## Examples

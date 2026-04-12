@@ -1,8 +1,11 @@
 # SML MQTT Client - Test Suite
 
-Tests for the sml-mqtt-cli library running on `qemu_riscv32` with an
-in-process fake MQTT broker.  No external broker, no network hardware,
-no Docker required.
+Two complementary test configurations:
+
+- **Unit tests** (`qemu_riscv32`, `esp32s3_devkitc`): in-process fake MQTT broker.
+  No external broker, no network hardware, no Docker required.
+- **Integration tests** (`native_sim`): real Mosquitto broker via ETH_NATIVE_TAP +
+  optional NAT routing.  Runs on the build machine as a native Linux process.
 
 ## Test approach
 
@@ -64,22 +67,24 @@ The fake broker speaks real MQTT 3.1.1 wire format for all packet types:
 - PINGREQ -> PINGRESP
 - DISCONNECT -> closes client socket
 
-### Why not native_sim with a real broker?
+### native_sim integration tests (optional)
 
-`native_sim` compiles Zephyr as a Linux executable and can bridge to
-the host network via TUN/TAP, making a real broker reachable.  This is
-a valid approach for integration testing but has trade-offs:
+`native_sim` compiles Zephyr as a Linux executable and bridges to the host
+network via the ETH_NATIVE_TAP driver, making a real broker reachable.  This
+configuration is used for the `sml_mqtt_integration` suite.
 
 | | fake broker (qemu_riscv32) | real broker (native_sim) |
 |---|---|---|
-| External dependency | None | Mosquitto must be running |
-| CI setup | Zero | broker install + startup script |
+| External dependency | None | Mosquitto must be reachable |
+| CI setup | Zero | privileged runner needed (ip tuntap) |
 | Portable to real hardware targets | Yes | No |
 | Timing determinism | Yes | Network jitter |
 | twister-compatible | All boards | native_sim only |
 
-The fake broker approach matches Zephyr's own CI and is the right
-choice for a library that targets embedded hardware.
+Both approaches are maintained: the fake broker matches Zephyr's own CI and
+validates state machine logic without any external dependencies; the
+integration suite validates real broker interoperability (QoS 0/1/2 confirmed
+with Mosquitto, April 3, 2026).
 
 ---
 
@@ -157,7 +162,7 @@ west flash
 west espressif monitor --port /dev/ttyACM0
 ```
 
-Expected output (20/20 pass, ~2 s total):
+Expected output (22/22 pass, ~2 s total):
 
 ```
 *** Booting Zephyr OS build v4.3.0 ***
@@ -173,7 +178,7 @@ TESTSUITE sml_mqtt_basic succeeded
 SUITE PASS - 100.00% [sml_mqtt_basic]:    pass=6  fail=0  skip=0  total=6
 SUITE PASS - 100.00% [sml_mqtt_multiple]: pass=5  fail=0  skip=0  total=5
 SUITE PASS - 100.00% [sml_mqtt_pubsub]:   pass=5  fail=0  skip=0  total=5
-SUITE PASS - 100.00% [sml_mqtt_qos]:      pass=4  fail=0  skip=0  total=4
+SUITE PASS - 100.00% [sml_mqtt_qos]:      pass=6  fail=0  skip=0  total=6
 PROJECT EXECUTION SUCCESSFUL
 ```
 
@@ -189,6 +194,53 @@ and `boards/<board>.overlay` files following the same pattern.
 
 ---
 
+### Integration tests: native_sim against real Mosquitto
+
+Requires a Mosquitto broker reachable from the build machine.  The
+`run_integration_tests.sh` script handles all TAP/routing setup.
+
+```bash
+# Build (broker address baked in at compile time)
+west build -p always -s sml-mqtt-cli/tests -b native_sim \
+  -- -DSML_MQTT_TEST_BROKER_HOST=<broker-ip>
+
+# LAN/remote broker (NAT via host uplink)
+sml-mqtt-cli/tests/scripts/run_integration_tests.sh \
+  --broker-host <broker-ip> --enable-routing --no-local-broker
+
+# Local broker on build machine
+mosquitto -c sml-mqtt-cli/tests/scripts/mosquitto_integration.conf &
+sml-mqtt-cli/tests/scripts/run_integration_tests.sh
+```
+
+The script:
+1. Grants `cap_net_admin` to the binary via `setcap` (binary runs as the
+   current user, not root)
+2. Launches the binary in the background; it creates the `zeth` TAP interface
+3. Polls until `zeth` appears then configures the host side: `192.0.2.1/24`
+4. Optionally enables `ip_forward` + `iptables MASQUERADE` for LAN/remote brokers
+5. Waits for the binary to exit and propagates the exit code
+6. Cleans up all iptables rules and the TAP interface on exit
+
+Expected output (7/7 pass, ~12 s total):
+
+```
+*** Booting Zephyr OS build v4.3.0 ***
+Running TESTSUITE sml_mqtt_integration
+ PASS - test_integ_connect_disconnect     in 2.560 seconds
+ PASS - test_integ_keepalive              in 3.520 seconds
+ PASS - test_integ_publish_qos0          in 0.550 seconds
+ PASS - test_integ_publish_qos1          in 1.370 seconds
+ PASS - test_integ_publish_qos2          in 2.380 seconds
+ PASS - test_integ_subscribe_qos_levels  in 0.700 seconds
+ PASS - test_integ_subscribe_receive     in 0.900 seconds
+TESTSUITE sml_mqtt_integration succeeded
+SUITE PASS - 100.00% [sml_mqtt_integration]: pass=7 fail=0 skip=0 total=7
+PROJECT EXECUTION SUCCESSFUL
+```
+
+---
+
 ### Code coverage
 
 Code coverage via gcov instrumentation is **not currently supported** on
@@ -199,9 +251,9 @@ whack-a-mole because the instrumentation touches the entire network
 subsystem, which we do not own.
 
 The correct solution is `native_sim` (unlimited stack, same Zephyr net
-subsystem).  That requires verifying that `CONFIG_NET_TEST` +
-`CONFIG_NET_LOOPBACK` work identically under `native_sim`, which is
-feasible but has not been done yet.  See STATUS.md for roadmap.
+subsystem).  The integration test suite already uses `native_sim` with
+`CONFIG_ETH_NATIVE_TAP`; adding gcov instrumentation there is feasible
+but has not been done yet.  See STATUS.md for roadmap.
 
 ---
 
@@ -234,8 +286,14 @@ feasible but has not been done yet.  See STATUS.md for roadmap.
 |------|------------------|
 | `test_publish_qos1` | QoS 1 full handshake: PUBLISH -> PUBACK; SM returns to Connected |
 | `test_publish_qos2` | QoS 2 full handshake: PUBLISH -> PUBREC -> PUBREL -> PUBCOMP |
+| `test_publish_qos1_then_subscribe` | **Regression**: after QoS 1 publish, SM must return to Connected so a subsequent subscribe is not silently dropped |
+| `test_publish_qos2_then_subscribe` | **Regression**: same for QoS 2 four-way handshake |
 | `test_subscribe_qos_levels` | Subscribe at QoS 0, 1, and 2 in sequence; SUBACK after each |
 | `test_retained_message` | retain=1 flag set on publish; subscribe on second client succeeds |
+
+The two regression tests specifically guard against a bug where the Boost.SML composite
+state machine outer SM became permanently stuck inside `publishing_sm` after any publish.
+See commit d6e1c53 and the comment block at the top of `test_qos_levels.cpp` for details.
 
 ### `sml_mqtt_multiple` (test_multiple_clients.cpp)
 
@@ -247,12 +305,26 @@ feasible but has not been done yet.  See STATUS.md for roadmap.
 | `test_keepalive` | mqtt_live() called directly; PINGREQ/PINGRESP processed if keepalive timer has elapsed |
 | `test_rapid_publish` | Ten QoS 0 messages sent back-to-back; all ten PASS |
 
+### `sml_mqtt_integration` (test_integration_broker.cpp, native_sim only)
+
+| Test | What it validates |
+|------|------------------|
+| `test_integ_connect_disconnect` | Full TCP + MQTT CONNECT/CONNACK/DISCONNECT with real Mosquitto |
+| `test_integ_publish_qos0` | QoS 0 fire-and-forget; client stays connected; real broker receives |
+| `test_integ_publish_qos1` | QoS 1 PUBLISH -> real PUBACK from Mosquitto; SM returns to Connected |
+| `test_integ_publish_qos2` | QoS 2 four-way handshake: PUBREC -> PUBREL -> PUBCOMP via real broker |
+| `test_integ_subscribe_receive` | Two clients; publisher sends, Mosquitto routes to subscriber; callback fires with correct topic+payload |
+| `test_integ_subscribe_qos_levels` | Subscribe at QoS 0, 1, 2 in sequence; real SUBACK after each |
+| `test_integ_keepalive` | mqtt_live() keeps session alive over 3 s; no unexpected disconnect |
+
 ---
 
 ## Last test run output
 
-Verified March 29, 2026, branch test/loopback-fake-broker (commit af39391),
-target qemu_riscv32, Zephyr v4.3-branch.
+### Unit tests (qemu_riscv32)
+
+Verified April 7, 2026, branch 4-test-with-external-broker, commit d6e1c53,
+target qemu_riscv32, Zephyr v4.3.0.
 
 ```
 Running TESTSUITE sml_mqtt_basic
@@ -278,17 +350,38 @@ Running TESTSUITE sml_mqtt_pubsub
  PASS - test_unsubscribe          in 0.200 seconds
 TESTSUITE sml_mqtt_pubsub succeeded
 Running TESTSUITE sml_mqtt_qos
- PASS - test_publish_qos1         in 0.140 seconds
- PASS - test_publish_qos2         in 0.200 seconds
- PASS - test_retained_message     in 0.200 seconds
- PASS - test_subscribe_qos_levels in 0.260 seconds
+ PASS - test_publish_qos1                  in 0.140 seconds
+ PASS - test_publish_qos1_then_subscribe   in 0.200 seconds
+ PASS - test_publish_qos2                  in 0.200 seconds
+ PASS - test_publish_qos2_then_subscribe   in 0.280 seconds
+ PASS - test_retained_message              in 0.200 seconds
+ PASS - test_subscribe_qos_levels          in 0.260 seconds
 TESTSUITE sml_mqtt_qos succeeded
 ------ TESTSUITE SUMMARY START ------
 SUITE PASS - 100.00% [sml_mqtt_basic]:    pass=6  fail=0  skip=0  total=6
 SUITE PASS - 100.00% [sml_mqtt_multiple]: pass=5  fail=0  skip=0  total=5
 SUITE PASS - 100.00% [sml_mqtt_pubsub]:   pass=5  fail=0  skip=0  total=5
-SUITE PASS - 100.00% [sml_mqtt_qos]:      pass=4  fail=0  skip=0  total=4
+SUITE PASS - 100.00% [sml_mqtt_qos]:      pass=6  fail=0  skip=0  total=6
 ------ TESTSUITE SUMMARY END ------
+PROJECT EXECUTION SUCCESSFUL
+```
+
+### Integration tests (native_sim)
+
+Verified April 3, 2026, branch test/loopback-fake-broker,
+target native_sim, Zephyr v4.3.0.  Real Mosquitto broker on LAN.
+
+```
+Running TESTSUITE sml_mqtt_integration
+ PASS - test_integ_connect_disconnect     in 2.560 seconds
+ PASS - test_integ_keepalive              in 3.520 seconds
+ PASS - test_integ_publish_qos0          in 0.550 seconds
+ PASS - test_integ_publish_qos1          in 1.370 seconds
+ PASS - test_integ_publish_qos2          in 2.380 seconds
+ PASS - test_integ_subscribe_qos_levels  in 0.700 seconds
+ PASS - test_integ_subscribe_receive     in 0.900 seconds
+TESTSUITE sml_mqtt_integration succeeded
+SUITE PASS - 100.00% [sml_mqtt_integration]: pass=7 fail=0 skip=0 total=7 duration=11.980 seconds
 PROJECT EXECUTION SUCCESSFUL
 ```
 

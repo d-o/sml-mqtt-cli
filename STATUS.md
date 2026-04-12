@@ -1,20 +1,25 @@
 # Project Status & Roadmap
 
-**Last Updated:** March 29, 2026
+**Last Updated:** April 8, 2026
 **Version:** 0.2.0-beta
-**Branch:** test/loopback-fake-broker
-**Status:** Beta - 20/20 unit tests passing on qemu_riscv32
+**Branch:** 4-test-with-external-broker
+**Status:** Beta - 22/22 unit tests passing on qemu_riscv32 (CI);
+7/7 integration tests passing on native_sim against real Mosquitto broker
 
 ## Project Overview
 
 An MQTT client library for Zephyr RTOS using Boost.SML (State Machine Language) for
 state management.  The library has a complete MQTT v3.1.1 implementation, a
 comprehensive self-contained unit test suite, and a GitHub Actions CI pipeline.
-All 20 unit tests pass with no external broker, no Docker, and no network hardware.
+All 22 unit tests pass with no external broker, no Docker, and no network hardware (qemu_riscv32).
+Hardware validation on ESP32-S3 (esp32s3_devkitc) confirmed: 20/20 tests pass (April 3, 2026,
+pre-bug-fix count; 2 regression tests added in d6e1c53 not yet re-run on hardware).
+7 integration tests pass on native_sim against a real Mosquitto broker
+using ETH_NATIVE_TAP + NAT routing - no mocking, real TCP/IP.
 
 ## Test Results
 
-Last verified: March 29, 2026, branch test/loopback-fake-broker, commit af39391.
+Last verified: April 7, 2026, branch 4-test-with-external-broker, commit d6e1c53.
 Target: qemu_riscv32, Zephyr v4.3-branch.
 
 ```
@@ -44,10 +49,58 @@ Running TESTSUITE sml_mqtt_pubsub
 TESTSUITE sml_mqtt_pubsub succeeded
 
 Running TESTSUITE sml_mqtt_qos
- PASS - test_publish_qos1            in 0.140 s
- PASS - test_publish_qos2            in 0.200 s
- PASS - test_retained_message        in 0.200 s
- PASS - test_subscribe_qos_levels    in 0.260 s
+ PASS - test_publish_qos1                  in 0.140 s
+ PASS - test_publish_qos1_then_subscribe   in 0.200 s
+ PASS - test_publish_qos2                  in 0.200 s
+ PASS - test_publish_qos2_then_subscribe   in 0.280 s
+ PASS - test_retained_message              in 0.200 s
+ PASS - test_subscribe_qos_levels          in 0.260 s
+TESTSUITE sml_mqtt_qos succeeded
+
+SUITE PASS - 100.00% [sml_mqtt_basic]:    pass=6  fail=0  total=6
+SUITE PASS - 100.00% [sml_mqtt_multiple]: pass=5  fail=0  total=5
+SUITE PASS - 100.00% [sml_mqtt_pubsub]:   pass=5  fail=0  total=5
+SUITE PASS - 100.00% [sml_mqtt_qos]:      pass=6  fail=0  total=6
+PROJECT EXECUTION SUCCESSFUL
+```
+
+### Hardware Test Results (ESP32-S3, April 3, 2026)
+
+Last verified: April 3, 2026, branch test/loopback-fake-broker.
+Target: esp32s3_devkitc/esp32s3/procpu, Zephyr v4.3.0.
+Build command: `west build -p always -s sml-mqtt-cli/tests -b esp32s3_devkitc/esp32s3/procpu`
+
+```
+Running TESTSUITE sml_mqtt_basic
+ PASS - test_c_api_connect           in 0.072 s
+ PASS - test_c_api_creation          in 0.011 s
+ PASS - test_client_creation         in 0.011 s
+ PASS - test_connect_disconnect      in 0.072 s
+ PASS - test_invalid_connect         in 0.011 s
+ PASS - test_invalid_init            in 0.011 s
+TESTSUITE sml_mqtt_basic succeeded
+
+Running TESTSUITE sml_mqtt_multiple
+ PASS - test_keepalive               in 0.071 s
+ PASS - test_mixed_api_usage         in 0.136 s
+ PASS - test_multiple_clients        in 0.199 s
+ PASS - test_rapid_publish           in 0.092 s
+ PASS - test_reconnection            in 0.134 s
+TESTSUITE sml_mqtt_multiple succeeded
+
+Running TESTSUITE sml_mqtt_pubsub
+ PASS - test_invalid_publish         in 0.072 s
+ PASS - test_loopback_pubsub         in 0.181 s
+ PASS - test_publish_qos0            in 0.074 s
+ PASS - test_subscribe               in 0.125 s
+ PASS - test_unsubscribe             in 0.179 s
+TESTSUITE sml_mqtt_pubsub succeeded
+
+Running TESTSUITE sml_mqtt_qos
+ PASS - test_publish_qos1            in 0.125 s
+ PASS - test_publish_qos2            in 0.178 s
+ PASS - test_retained_message        in 0.188 s
+ PASS - test_subscribe_qos_levels    in 0.233 s
 TESTSUITE sml_mqtt_qos succeeded
 
 SUITE PASS - 100.00% [sml_mqtt_basic]:    pass=6  fail=0  total=6
@@ -57,14 +110,34 @@ SUITE PASS - 100.00% [sml_mqtt_qos]:      pass=4  fail=0  total=4
 PROJECT EXECUTION SUCCESSFUL
 ```
 
-## Known Limitations
+### Integration Test Results (native_sim, April 3, 2026)
 
-- Requires manual ZEPHYR_MODULES configuration in existing workspaces
-  (documented in tests/README.md and the CI workflow)
-- Error handling paths validated in unit tests but not in field deployment
-- No performance benchmarking done
-- Not thread-safe (one client per thread)
-- No automatic reconnection (application responsibility)
+Last verified: April 3, 2026, branch test/loopback-fake-broker.
+Target: native_sim, Zephyr v4.3.0.
+Broker: Mosquitto on a LAN host, reached via NAT (ETH_NATIVE_TAP + iptables MASQUERADE on build machine).
+Build command: `west build -p always -s sml-mqtt-cli/tests -b native_sim -- -DSML_MQTT_TEST_BROKER_HOST=<broker-ip>`
+Run command: `sml-mqtt-cli/tests/scripts/run_integration_tests.sh --broker-host <broker-ip> --enable-routing --no-local-broker`
+
+```
+Running TESTSUITE sml_mqtt_integration
+ PASS - test_integ_connect_disconnect     in 2.560 s
+ PASS - test_integ_keepalive              in 3.520 s
+ PASS - test_integ_publish_qos0          in 0.550 s
+ PASS - test_integ_publish_qos1          in 1.370 s
+ PASS - test_integ_publish_qos2          in 2.380 s
+ PASS - test_integ_subscribe_qos_levels  in 0.700 s
+ PASS - test_integ_subscribe_receive     in 0.900 s
+TESTSUITE sml_mqtt_integration succeeded
+
+SUITE PASS - 100.00% [sml_mqtt_integration]: pass=7  fail=0  skip=0  total=7  duration=11.980 s
+PROJECT EXECUTION SUCCESSFUL
+```
+
+Infrastructure notes:
+- Binary runs as normal user (cap_net_admin granted via setcap, not setuid/sudo)
+- ETH_NATIVE_TAP driver creates `zeth` TAP interface; host side assigned 192.0.2.1/24
+- NAT via iptables MASQUERADE allows Zephyr app (192.0.2.2) to reach LAN broker
+- Script: `tests/scripts/run_integration_tests.sh` handles all setup/teardown automatically
 
 ## Development History
 
@@ -130,8 +203,8 @@ PROJECT EXECUTION SUCCESSFUL
   - States: idle, qos0, qos1, qos2, releasing
   - Guards on QoS field enable symmetric architecture
 - **receiving_sm submachine**: Dedicated lifecycle for incoming messages
-  - States: idle, processing, acking, received, waiting_rel
-  - Symmetric to publishing with explicit states for all QoS levels
+  - States: idle, waiting_rel (QoS 0/1 complete immediately at sml::X)
+  - Outer SM returns to Connected via evt_transaction_done after each sub-SM terminal step
 - **Main state machine**: Connection management only
   - Transitions to submachines for message operations
   - Clean separation of concerns
@@ -143,7 +216,7 @@ PROJECT EXECUTION SUCCESSFUL
 4. Better error isolation within submachines
 5. Solves SML limitation with multiple guards on same event
 
-**Result:** Clean hierarchical design with ~15 total states across 3 state machines
+**Result:** Clean hierarchical design with ~12 total states across 3 state machines
 
 ### March 29, 2026 - Test Infrastructure: In-Process Fake Broker (Phase 1)
 
@@ -198,6 +271,94 @@ passing end-to-end.
 
 **Result:** 20/20 tests passing.  PROJECT EXECUTION SUCCESSFUL.
 
+### April 7, 2026 - Composite SM Bug Fix: evt_transaction_done (Phase 5)
+
+**Bug Identified:** The Boost.SML composite state machine outer SM became permanently
+stuck inside `publishing_sm` or `receiving_sm` after any publish or receive operation.
+`sml::X` (terminate) in a sub-SM does NOT automatically fire a completion transition
+in the outer SM.  Symptom: `get_state()` returned the inner state instead of "Connected",
+and subsequent `subscribe()` calls were silently dropped.
+
+**Resolution:**
+- Added synthetic `evt_transaction_done` event (internal-only).
+- MQTT event handler fires it after each terminal inner-SM event (PUBACK, PUBCOMP,
+  PUBREL, etc.).  The outer SM handles it to return to Connected:
+  `sml::state<publishing_sm> + event<evt_transaction_done> = "Connected"_s`
+- Both sub-SMs retain their full QoS lifecycles unchanged.
+- Added `CONFIG_NET_LOOPBACK=y` to `tests/boards/qemu_riscv32.conf`
+  (NET_TEST does not auto-select NET_LOOPBACK; its absence caused bind() errno 125).
+- Added 2 regression tests to sml_mqtt_qos suite:
+  `test_publish_qos1_then_subscribe` and `test_publish_qos2_then_subscribe`.
+
+**Result:** 22/22 unit tests passing (qemu_riscv32), 7/7 integration tests passing.
+Functional commit: d6e1c53.
+
+### April 3, 2026 - Integration Test Suite: native_sim + Real Broker (Phase 4)
+
+**Achievement:** Added a second test build configuration targeting native_sim
+with the ETH_NATIVE_TAP driver so the Zephyr MQTT client can connect to a real
+Mosquitto instance running on the build host.
+
+**Architecture:**
+- native_sim runs as a native Linux process with a TAP virtual Ethernet interface
+  (zeth, created by the binary on startup).  The host gets 192.0.2.1/24 on zeth;
+  the Zephyr app gets 192.0.2.2.  Mosquitto (or any reachable broker) is addressed
+  via 192.0.2.1 (local) or via NAT through the host uplink (LAN/remote).
+- CONFIG_ETH_NATIVE_TAP is the compile-time gate: when set, CMakeLists.txt
+  compiles only main.cpp + test_integration_broker.cpp.  The four loopback
+  suites and fake_broker.cpp are excluded.  The #if !defined(CONFIG_ETH_NATIVE_TAP)
+  guard in main.cpp prevents the fake-broker before/after hooks and ZTEST_SUITE
+  registrations from being compiled.
+
+**New files:**
+- tests/src/test_integration_broker.cpp: 7-test sml_mqtt_integration suite.
+  Tests: connect_disconnect, publish_qos0, publish_qos1, publish_qos2,
+  subscribe_receive (two-client pub/sub through real broker),
+  subscribe_qos_levels, keepalive.
+  Uses wait_for_state() and wait_rx() polling helpers with k_uptime_get()
+  deadlines instead of the synchronous fake_broker_process() interleaving.
+- tests/boards/native_sim.conf: ETH_NATIVE_TAP, NET_CONFIG_SETTINGS, static
+  IP 192.0.2.2 with gateway 192.0.2.1, NATIVE_SIM_SLOWDOWN_TO_REAL_TIME.
+- tests/boards/qemu_riscv32.conf: NET_TEST (selects LOOPBACK + NET_DRIVERS)
+  factored out of prj.conf so native_sim does not inherit it.
+- tests/scripts/run_integration_tests.sh: full setup/teardown script with
+  support for three broker locations:
+    1. Local: Mosquitto on build machine (default, no extra routing needed)
+    2. LAN:   --broker-host <LAN IP> --enable-routing --no-local-broker
+    3. Remote: --broker-host <hostname> --enable-routing --no-local-broker
+  --enable-routing enables net.ipv4.ip_forward + iptables MASQUERADE on
+  the host's uplink interface (auto-detected).  The Zephyr app already has
+  gateway=192.0.2.1 so all non-TAP traffic routes via the host.
+  All iptables rules and the TAP interface are cleaned up on EXIT/INT/TERM.
+- tests/scripts/mosquitto_integration.conf: minimal permissive broker config.
+
+**Broker address is configurable at build time (no source edits):**
+  Default: 192.0.2.1:1883 (host-side TAP IP)
+  Override: west build ... -DSML_MQTT_TEST_BROKER_HOST="192.168.1.50"
+  CMakeLists.txt injects the value as a compile definition; CMake prints the
+  active broker address during the configure step.
+
+**Refactored:**
+- tests/prj.conf: NET_TEST and NET_LOOPBACK moved to board-specific conf
+  files (qemu_riscv32.conf, esp32s3_devkitc_procpu.conf).  prj.conf now
+  contains only settings common to all build targets.
+- tests/testcase.yaml: added libraries.sml_mqtt_cli.integration variant for
+  native_sim alongside the existing .unit variant for qemu_riscv32.
+
+**Status:** 7/7 integration tests passing (April 3, 2026). Real TCP/IP to a LAN
+Mosquitto broker confirmed via ETH_NATIVE_TAP + NAT routing.
+
+### April 3, 2026 - Hardware Validation on ESP32-S3
+
+**Achievement:** All 20 unit tests confirmed passing on real hardware.
+
+- Target: esp32s3_devkitc/esp32s3/procpu (ESP32-S3 QFN56, revision v0.2)
+- Zephyr v4.3.0, Xtensa toolchain via Zephyr SDK 0.16.9
+- Flash: 8 MB Winbond SPI, DIO mode, 80 MHz
+- Same fake-broker + loopback approach as QEMU; no external broker required
+- All 4 suites (basic, multiple, pubsub, qos) pass at 100%
+- **Result:** Hardware-in-the-loop validation complete for ESP32-S3
+
 ## Current Features
 
 ### Core MQTT Operations
@@ -210,10 +371,11 @@ passing end-to-end.
 - Will messages (via Zephyr MQTT)
 
 ### State Machine Architecture
-- Hierarchical design with 3 state machines (~15 total states)
-- Main SM: Connection management (6 states)
-- Publishing submachine: QoS-specific lifecycles (5 states)
-- Receiving submachine: Symmetric to publishing (5 states)
+- Hierarchical design with 3 state machines (~12 total states)
+- Main SM: Connection management (4 outer states + 2 sub-SM placeholders)
+- Publishing submachine: QoS-specific lifecycles (idle, qos0, qos1, qos2, releasing → sml::X)
+- Receiving submachine: idle + waiting_rel (QoS 0/1 complete immediately at sml::X)
+- Outer SM returns to Connected via evt_transaction_done after each sub-SM terminal step
 - Event-driven transitions with guards on runtime data
 - Timeout guards for connection
 - Protocol-compliant handshakes
@@ -233,9 +395,10 @@ passing end-to-end.
 - Multiple independent client instances
 
 ### Testing
-- 20 test cases in 4 suites, all passing (qemu_riscv32)
+- 22 test cases in 4 suites, all passing (qemu_riscv32 CI, April 7, 2026)
 - In-process fake broker: no external broker, no Docker, no network hardware
 - QoS 0/1/2 publish and subscribe validated end-to-end
+- Regression tests guard against composite SM stuck-after-publish bug (commit d6e1c53)
 - Loopback pubsub: subscribe, publish, receive, callback fires on same client
 - Multiple sequential clients, reconnection, mixed C/C++ API
 - Keepalive PINGREQ/PINGRESP cycle
@@ -281,6 +444,18 @@ passing end-to-end.
 - Not thread-safe (use one client per thread)
 - No offline message queueing
 - Messages exceeding buffer size are truncated
+- **No per-operation timeout for QoS 1/2 handshakes**: if PUBACK/PUBREC/PUBCOMP
+  never arrives, the SM is permanently stuck in the publishing or receiving sub-SM.
+  All subsequent publish() and subscribe() calls are silently dropped.  Recovery
+  requires calling disconnect() and reconnecting.  The MQTT 3.1.1 spec (§4.4)
+  requires retransmission with DUP=1; this is not implemented (planned for 0.3.0).
+- **Only one publish or receive in flight at a time**: the outer SM is either inside
+  publishing_sm or receiving_sm, never both.  Calling publish() while a QoS 1/2
+  publish is in progress sends the MQTT packet but the SM event is dropped; the second
+  publish is untracked.  An incoming PUBLISH while publishing is more serious: the
+  evt_transaction_done fired for incoming QoS 0/1 messages exits publishing_sm early,
+  silently aborting the outgoing QoS 1/2 handshake.  The correct fix is Boost.SML
+  orthogonal regions so publishing_sm and receiving_sm run in parallel (planned for 0.3.0).
 
 ### Platform
 - Requires Zephyr RTOS 4.3+
@@ -294,14 +469,17 @@ passing end-to-end.
 
 **Testing Infrastructure - Complete:**
 - In-process fake MQTT broker for qemu_riscv32 (no external dependencies)
-- 20/20 unit tests passing: connection, pub/sub, QoS 0/1/2, multi-client
+- 22/22 unit tests passing: connection, pub/sub, QoS 0/1/2, multi-client, SM regression tests
+- Integration test suite for native_sim against real Mosquitto (April 7, 2026)
+  - 7 tests: connect/disconnect, QoS 0/1/2 publish, subscribe+receive, keepalive
+  - ETH_NATIVE_TAP + static IP; run_integration_tests.sh handles all setup
 - GitHub Actions CI pipeline (.github/workflows/tests.yml)
-- Twister test descriptor (tests/testcase.yaml)
+- Twister test descriptor (tests/testcase.yaml) with unit + integration variants
 - SDK caching in CI (fast reruns after first build)
 
 **Testing Infrastructure - Remaining:**
-- [ ] Integration tests against real brokers (Mosquitto, EMQX) via native_sim
-- [ ] Hardware-in-the-loop tests on ESP32-S3
+- [ ] CI job for integration tests (requires privileged runner for ip tuntap)
+- Hardware-in-the-loop tests on ESP32-S3: COMPLETE (April 3, 2026, 20/20 pass)
 - [ ] Long-term stability testing (72+ hour runs)
 - [ ] Performance benchmarking (throughput, latency, RAM)
 
@@ -314,7 +492,7 @@ passing end-to-end.
 - C API wrapper validated against C++ implementation
 
 **Validation - Remaining:**
-- [ ] Real-broker interoperability (Mosquitto 2.x, EMQX)
+- Real-broker interoperability: Mosquitto confirmed (7/7 integration tests, April 3, 2026)
 - [ ] Error path testing under adverse network conditions
 - [ ] Memory profiling under sustained load
 
@@ -426,7 +604,7 @@ passing end-to-end.
 ### MQTT Brokers
 | Broker | Status | Notes |
 |--------|--------|-------|
-| Mosquitto | Tested | v2.0+ |
+| Mosquitto | Validated | v2.0+, 7/7 integration tests passing (April 3, 2026) |
 | EMQX | Untested | Should work |
 | HiveMQ | Untested | Should work |
 | AWS IoT Core | Untested | Requires TLS |
@@ -434,7 +612,17 @@ passing end-to-end.
 
 ## Build Status
 
-### Test Results (qemu_riscv32, Zephyr v4.3-branch)
+### Test Results (qemu_riscv32, Zephyr v4.3-branch, April 7, 2026)
+
+| Suite | Tests | Result |
+|-------|-------|--------|
+| sml_mqtt_basic | 6/6 | PASS |
+| sml_mqtt_multiple | 5/5 | PASS |
+| sml_mqtt_pubsub | 5/5 | PASS |
+| sml_mqtt_qos | 6/6 | PASS |
+| **Total** | **22/22** | **PROJECT EXECUTION SUCCESSFUL** |
+
+### Test Results (esp32s3_devkitc/esp32s3/procpu, Zephyr v4.3.0, April 3, 2026)
 
 | Suite | Tests | Result |
 |-------|-------|--------|
@@ -444,6 +632,10 @@ passing end-to-end.
 | sml_mqtt_qos | 4/4 | PASS |
 | **Total** | **20/20** | **PROJECT EXECUTION SUCCESSFUL** |
 
+Note: ESP32-S3 hardware result is from April 3, 2026 (commit pre-dating the 2 new
+regression tests added in d6e1c53). The 2 new sml_mqtt_qos tests have not yet been
+re-run on hardware.
+
 ### Static Analysis
 - Compiler Warnings: 0 (with -Wall -Wextra)
 - Code Style: follows Zephyr conventions
@@ -452,6 +644,79 @@ passing end-to-end.
 - Heap Allocation: 0 bytes (verified)
 - Stack Usage: ~1 KB worst case
 - Static Memory: ~2.4 KB per client (configurable)
+
+## Memory Footprint Evidence (ESP32-S3, April 3, 2026)
+
+Generated by `west build -t ram_report` and `west build -t rom_report` against
+the test binary built for `esp32s3_devkitc/esp32s3/procpu`, Zephyr v4.3.0.
+All figures are for the test binary (library + test harness + fake broker).
+
+### RAM (DRAM)  249,732 bytes total
+
+| Category | Bytes | % | Notes |
+|----------|------:|--:|-------|
+| Zephyr kernel internals (hidden) | 174,681 | 69.9% | Stacks, scheduler, net buffers |
+| Zephyr base (subsystems/drivers) | 60,925 | 24.4% | Networking, MQTT lib, drivers |
+| WORKSPACE (application code) | 13,420 | 5.4% | See below |
+| Generated / ISR table | 256 | 0.1% | |
+
+Workspace RAM breakdown:
+
+| Source | Bytes | Notes |
+|--------|------:|-------|
+| sml-mqtt-cli/tests/src | 10,712 | Static mqtt_client storage objects in tests |
+| &nbsp;&nbsp;test_basic_connection.cpp | 5,216 | Two 2,488 B C API client storage buffers |
+| &nbsp;&nbsp;test_multiple_clients.cpp | 2,688 | One 2,488 B C API client storage buffer |
+| &nbsp;&nbsp;fake_broker.cpp | 1,640 | 1,500 B packet buffer + 128 B topic store |
+| &nbsp;&nbsp;test_publish_subscribe.cpp | 848 | 512 B rx payload + 128 B topic buffer |
+| modules/hal/espressif | 2,451 | ESP32 HAL globals (clocks, MMU, timers) |
+| boost-sml/include | 257 | SML state-name guard vars (.dram0.bss) |
+
+Note: each ~2,488 B client storage buffer matches the documented ~2.4 KB per
+client.  The SML state machine adds zero RAM overhead beyond the context struct.
+
+### ROM (Flash)  189,146 bytes total
+
+| Category | Bytes | % | Notes |
+|----------|------:|--:|-------|
+| Zephyr base | 106,947 | 56.5% | Networking stack, MQTT lib, drivers |
+| WORKSPACE (application code) | 42,524 | 22.5% | See below |
+| C++ runtime / unwind (hidden) | 27,151 | 14.4% | libstdc++, exception tables |
+| Anonymous / compiler symbols | 12,167 | 6.4% | |
+| Generated | 267 | 0.1% | |
+
+Workspace ROM breakdown:
+
+| Source | Bytes | Notes |
+|--------|------:|-------|
+| modules/hal/espressif | 31,216 | ESP32 platform cost (HAL + WiFi glue) |
+| sml-mqtt-cli/tests/src | 5,673 | Test functions + fake broker code |
+| &nbsp;&nbsp;fake_broker.cpp | 1,397 | broker_receive 777 B, init 216 B |
+| &nbsp;&nbsp;test_publish_subscribe.cpp | 1,375 | |
+| &nbsp;&nbsp;test_qos_levels.cpp | 1,047 | |
+| &nbsp;&nbsp;test_multiple_clients.cpp | 969 | |
+| &nbsp;&nbsp;test_basic_connection.cpp | 815 | |
+| boost-sml/include | 3,075 | SM dispatch tables (sm_impl process_event) |
+| sml-mqtt-cli/include | 2,560 | Library methods compiled into flash |
+| &nbsp;&nbsp;mqtt_evt_handler | 1,011 | MQTT event -> SML event dispatcher |
+| &nbsp;&nbsp;publish() | 338 | |
+| &nbsp;&nbsp;subscribe() | 244 | |
+| &nbsp;&nbsp;connect() | 238 | |
+| &nbsp;&nbsp;constructor | 216 | |
+
+### Library-only footprint summary
+
+Excluding the test harness, fake broker, and platform HAL:
+
+| Component | RAM | ROM |
+|-----------|----:|----:|
+| sml-mqtt-cli library (per client, default config) | ~2,488 B | ~2,560 B |
+| Boost.SML dispatch tables | ~257 B | ~3,075 B |
+| **Library total (one client)** | **~2.7 KB** | **~5.6 KB** |
+
+Zephyr networking stack + MQTT library (platform cost, not library cost):
+~107 KB ROM, ~61 KB RAM -- these are present in any Zephyr MQTT application
+regardless of which wrapper library is used.
 
 ## Getting Help
 
@@ -465,7 +730,8 @@ passing end-to-end.
 1. **Connection fails:** Check broker is running and accessible
 2. **Build errors:** Verify C++17 and Boost.SML are enabled
 3. **Memory errors:** Increase buffer sizes in Kconfig
-4. **Test failures:** Ensure broker on localhost:8883
+4. **Unit test failures:** Verify build target (qemu_riscv32 or esp32s3_devkitc); no broker needed
+   **Integration test failures:** Verify broker is reachable and run_integration_tests.sh is used
 
 ### Support Channels
 - GitHub Issues (when repository is public)
@@ -491,7 +757,7 @@ passing end-to-end.
 
 ## License
 
-Copyright (c) 2025 Dean Sellers (dean@sellers.id.au)
+Copyright (c) 2026 sml-mqtt-cli contributors
 SPDX-License-Identifier: MIT
 
 ## Acknowledgments
