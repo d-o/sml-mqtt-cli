@@ -246,17 +246,18 @@ struct mqtt_context {
 
 	mqtt_context() noexcept
 		: client{}, rx_buffer{}, tx_buffer{}, client_id{}, current_topic{}, current_payload{},
-		  broker_addr{}, subscriptions{}, connected(false), next_message_id(1),
-		  pending_message_id(0), current_payload_len(0), last_activity_ms(0),
-		  connect_start_ms(0), publish_op_start_ms(0), receive_op_start_ms(0),
-		  qos_timeout_ms(CONFIG_SML_MQTT_CLI_PUBLISH_TIMEOUT_MS),
-		  state_change_cb(nullptr), publish_received_cb(nullptr),
-		  user_data(nullptr), parent(nullptr)
+		  broker_addr{}
 #if defined(CONFIG_MQTT_LIB_TLS)
 		  , tls_sec_tags{}, tls_sec_tag_count(0),
 		  tls_peer_verify(TLS_PEER_VERIFY_REQUIRED), tls_enabled(false),
 		  tls_hostname{}
 #endif
+		  , subscriptions{}, connected(false), next_message_id(1),
+		  pending_message_id(0), current_payload_len(0), last_activity_ms(0),
+		  connect_start_ms(0), publish_op_start_ms(0), receive_op_start_ms(0),
+		  qos_timeout_ms(CONFIG_SML_MQTT_CLI_PUBLISH_TIMEOUT_MS),
+		  state_change_cb(nullptr), publish_received_cb(nullptr),
+		  user_data(nullptr), parent(nullptr)
 	{}
 
 	~mqtt_context() = default;
