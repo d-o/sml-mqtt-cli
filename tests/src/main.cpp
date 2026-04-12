@@ -93,9 +93,10 @@ static void broker_after(void *fixture)
 	fake_broker_destroy();
 }
 
-ZTEST_SUITE(sml_mqtt_basic,    NULL, NULL, broker_before, broker_after, NULL);
-ZTEST_SUITE(sml_mqtt_pubsub,   NULL, NULL, broker_before, broker_after, NULL);
-ZTEST_SUITE(sml_mqtt_qos,      NULL, NULL, broker_before, broker_after, NULL);
-ZTEST_SUITE(sml_mqtt_multiple, NULL, NULL, broker_before, broker_after, NULL);
+ZTEST_SUITE(sml_mqtt_basic,       NULL, NULL, broker_before, broker_after, NULL);
+ZTEST_SUITE(sml_mqtt_pubsub,      NULL, NULL, broker_before, broker_after, NULL);
+ZTEST_SUITE(sml_mqtt_qos,         NULL, NULL, broker_before, broker_after, NULL);
+ZTEST_SUITE(sml_mqtt_multiple,    NULL, NULL, broker_before, broker_after, NULL);
+ZTEST_SUITE(sml_mqtt_concurrent,  NULL, NULL, broker_before, broker_after, NULL);
 
 #endif /* !CONFIG_ETH_NATIVE_TAP */

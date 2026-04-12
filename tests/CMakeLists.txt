@@ -70,6 +70,7 @@ else()
     src/test_publish_subscribe.cpp
     src/test_qos_levels.cpp
     src/test_multiple_clients.cpp
+    src/test_concurrent_ops.cpp
   )
 endif()
 

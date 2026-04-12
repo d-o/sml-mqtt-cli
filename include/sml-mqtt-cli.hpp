@@ -58,6 +58,10 @@ namespace sml_mqtt_cli {
 #define CONFIG_SML_MQTT_CLI_KEEPALIVE_SEC 60
 #endif
 
+#ifndef CONFIG_SML_MQTT_CLI_PUBLISH_TIMEOUT_MS
+#define CONFIG_SML_MQTT_CLI_PUBLISH_TIMEOUT_MS 5000
+#endif
+
 // ============================================================================
 // Forward declarations and types
 // ============================================================================
@@ -147,12 +151,14 @@ struct evt_publish_received {
 
 struct evt_pingresp {} __attribute__((packed));
 
-// Synthetic completion signal fired via back::process from within a sub-SM action
-// when a publish or receive transaction reaches its terminal step (sml::X).
-// The outer SM listens for this on sml::state<publishing_sm> and
-// sml::state<receiving_sm> to transition back to "Connected".
-// It is an internal event — never fire it directly from application code.
-struct evt_transaction_done {} __attribute__((packed));
+// Synthetic completion signals fired by mqtt_evt_handler after a sub-SM
+// transaction reaches its terminal step (sml::X).  The outer SM listens for
+// each on its respective composite state to transition back to "Connected".
+// Separate types prevent an incoming-receive completion from prematurely
+// exiting an in-progress publish handshake and vice versa.
+// These are internal events — never fire them directly from application code.
+struct evt_publish_done {} __attribute__((packed));
+struct evt_receive_done {} __attribute__((packed));
 
 // ============================================================================
 // Context - holds all client state and buffers
@@ -188,6 +194,12 @@ struct mqtt_context {
 	int64_t last_activity_ms;
 	int64_t connect_start_ms;
 
+	// Per-operation QoS timeouts — one field per sub-SM so live() can fire
+	// the correct typed completion event even if both paths are active.
+	int64_t publish_op_start_ms;  // 0 = no active outgoing QoS 1/2 operation
+	int64_t receive_op_start_ms;  // 0 = no active incoming QoS 2 PUBREL wait
+	int64_t publish_timeout_ms;   // configurable; 0 = disabled
+
 	// Callbacks for C API
 	state_change_cb_t state_change_cb;
 	publish_received_cb_t publish_received_cb;
@@ -200,7 +212,9 @@ struct mqtt_context {
 		: client{}, rx_buffer{}, tx_buffer{}, client_id{}, current_topic{}, current_payload{},
 		  broker_addr{}, subscriptions{}, connected(false), next_message_id(1),
 		  pending_message_id(0), current_payload_len(0), last_activity_ms(0),
-		  connect_start_ms(0), state_change_cb(nullptr), publish_received_cb(nullptr),
+		  connect_start_ms(0), publish_op_start_ms(0), receive_op_start_ms(0),
+		  publish_timeout_ms(CONFIG_SML_MQTT_CLI_PUBLISH_TIMEOUT_MS),
+		  state_change_cb(nullptr), publish_received_cb(nullptr),
 		  user_data(nullptr), parent(nullptr) {}
 
 	~mqtt_context() = default;
@@ -455,18 +469,19 @@ struct mqtt_state_machine {
 			"Connected"_s + event<evt_disconnect> / on_disconnected = "Disconnected"_s,
 
 			// Publishing: enter composite sub-SM on publish.
-			// publishing_sm self-signals evt_transaction_done (via back::process)
-			// when the QoS lifecycle completes; the outer SM listens here to
-			// exit the composite state back to Connected.
+			// mqtt_evt_handler fires evt_publish_done when the QoS lifecycle
+			// completes; the outer SM listens here to exit back to Connected.
+			// Using a typed event (not shared evt_transaction_done) means an
+			// incoming receive completion cannot prematurely exit this state.
 			"Connected"_s + event<evt_publish>                                     = sml::state<publishing_sm>,
-			sml::state<publishing_sm> + event<evt_transaction_done>                = "Connected"_s,
+			sml::state<publishing_sm> + event<evt_publish_done>                   = "Connected"_s,
 			sml::state<publishing_sm> + event<evt_disconnect> / on_disconnected    = "Disconnected"_s,
 
 			// Receiving: enter composite sub-SM on any incoming publish.
-			// receiving_sm self-signals evt_transaction_done when the QoS
-			// lifecycle completes (immediately for QoS 0/1, after PUBREL for QoS 2).
+			// mqtt_evt_handler fires evt_receive_done when the QoS lifecycle
+			// completes (immediately for QoS 0/1, after PUBREL for QoS 2).
 			"Connected"_s + event<evt_publish_received>                            = sml::state<receiving_sm>,
-			sml::state<receiving_sm>  + event<evt_transaction_done>                = "Connected"_s,
+			sml::state<receiving_sm>  + event<evt_receive_done>                   = "Connected"_s,
 			sml::state<receiving_sm>  + event<evt_disconnect> / on_disconnected    = "Disconnected"_s,
 
 			// Subscribing
@@ -629,14 +644,20 @@ public:
 		param.dup_flag = 0;
 		param.retain_flag = retain ? 1 : 0;
 
-		// Process event
+		// Start the per-operation timer for QoS 1/2 before firing the event.
+		// The timer is cleared by the event handler on normal completion or
+		// by live() on timeout; it is not set for QoS 0 (completes inline).
+		if (qos != MQTT_QOS_0_AT_MOST_ONCE) {
+			ctx_.publish_op_start_ms = k_uptime_get();
+		}
+
 		evt_publish evt = {topic, payload, payload_len, qos, retain};
 		sm_.process_event(evt);
 
 		int ret = mqtt_publish(&ctx_.client, &param);
 		if (ret == 0 && qos == MQTT_QOS_0_AT_MOST_ONCE) {
 			sm_.process_event(evt_publish_sent{});
-			sm_.process_event(evt_transaction_done{});
+			sm_.process_event(evt_publish_done{});
 		}
 
 		return ret;
@@ -742,12 +763,36 @@ public:
 		return mqtt_input(&ctx_.client);
 	}
 
-	// Keep connection alive (call periodically)
+	// Keep connection alive (call periodically).
+	// Also drives per-operation QoS timeouts: if a QoS 1/2 handshake has been
+	// waiting longer than publish_timeout_ms, the in-flight operation is
+	// abandoned and the SM returns to Connected so new operations can proceed.
 	int live() noexcept {
 		if (!ctx_.connected) {
 			return -ENOTCONN;
 		}
+		if (ctx_.publish_timeout_ms > 0) {
+			int64_t now = k_uptime_get();
+			if (ctx_.publish_op_start_ms != 0 &&
+			    (now - ctx_.publish_op_start_ms) >= ctx_.publish_timeout_ms) {
+				LOG_WRN("QoS publish operation timed out");
+				ctx_.publish_op_start_ms = 0;
+				ctx_.pending_message_id  = 0;
+				sm_.process_event(evt_publish_done{});
+			}
+			if (ctx_.receive_op_start_ms != 0 &&
+			    (now - ctx_.receive_op_start_ms) >= ctx_.publish_timeout_ms) {
+				LOG_WRN("QoS receive operation timed out");
+				ctx_.receive_op_start_ms = 0;
+				sm_.process_event(evt_receive_done{});
+			}
+		}
 		return mqtt_live(&ctx_.client);
+	}
+
+	// Set per-operation QoS timeout.  Pass 0 to disable.
+	void set_publish_timeout_ms(int64_t ms) noexcept {
+		ctx_.publish_timeout_ms = ms;
 	}
 
 	// Check if connected
@@ -838,9 +883,11 @@ private:
 			sm_.process_event(pub_evt);
 
 			// QoS 0/1: receiving_sm reached X; signal completion to outer SM.
-			// QoS 2: inner SM is at "waiting_rel"; we must wait for PUBREL.
+			// QoS 2: inner SM is at "waiting_rel"; start the PUBREL timeout timer.
 			if (p->message.topic.qos != MQTT_QOS_2_EXACTLY_ONCE) {
-				sm_.process_event(evt_transaction_done{});
+				sm_.process_event(evt_receive_done{});
+			} else {
+				ctx_.receive_op_start_ms = k_uptime_get();
 			}
 
 			// Call user callback
@@ -864,9 +911,10 @@ private:
 				ack_ret = mqtt_publish_qos2_receive(&ctx_.client, &rec);
 				if (ack_ret < 0) {
 					LOG_ERR("Failed to send PUBREC: %d", ack_ret);
+					ctx_.receive_op_start_ms = 0;
 					evt_send_error err = {ack_ret, "pubrec"};
 					sm_.process_event(err);
-					sm_.process_event(evt_transaction_done{});
+					sm_.process_event(evt_receive_done{});
 				}
 			}
 			break;
@@ -874,7 +922,8 @@ private:
 		case MQTT_EVT_PUBACK: {
 			evt_puback ack = {evt->param.puback.message_id};
 			sm_.process_event(ack);
-			sm_.process_event(evt_transaction_done{});
+			ctx_.publish_op_start_ms = 0;  /* QoS 1 complete; clear timeout timer */
+			sm_.process_event(evt_publish_done{});
 			break;
 		}
 		case MQTT_EVT_PUBREC: {
@@ -886,18 +935,22 @@ private:
 			int ret = mqtt_publish_qos2_release(&ctx_.client, &rel);
 			if (ret < 0) {
 				LOG_ERR("Failed to send PUBREL: %d", ret);
+				ctx_.publish_op_start_ms = 0;  /* abort; clear timer */
 				evt_send_error err = {ret, "pubrel"};
 				sm_.process_event(err);
-				sm_.process_event(evt_transaction_done{});
+				sm_.process_event(evt_publish_done{});
+			} else {
+				/* Restart timer: broker has a fresh window to send PUBCOMP. */
+				ctx_.publish_op_start_ms = k_uptime_get();
 			}
-			// Success: inner SM stays at "releasing"; wait for PUBCOMP.
 			break;
 		}
 		case MQTT_EVT_PUBREL: {
 			evt_pubrel rel = {evt->param.pubrel.message_id};
 			sm_.process_event(rel);
+			ctx_.receive_op_start_ms = 0;  /* incoming QoS 2 complete; clear timer */
 			// receiving_sm reached X; signal completion before sending PUBCOMP.
-			sm_.process_event(evt_transaction_done{});
+			sm_.process_event(evt_receive_done{});
 
 			// Send PUBCOMP (SM is now at Connected; a send failure is logged only).
 			struct mqtt_pubcomp_param comp = {evt->param.pubrel.message_id};
@@ -910,7 +963,8 @@ private:
 		case MQTT_EVT_PUBCOMP: {
 			evt_pubcomp comp = {evt->param.pubcomp.message_id};
 			sm_.process_event(comp);
-			sm_.process_event(evt_transaction_done{});
+			ctx_.publish_op_start_ms = 0;  /* QoS 2 complete; clear timeout timer */
+			sm_.process_event(evt_publish_done{});
 			break;
 		}
 		case MQTT_EVT_SUBACK: {
@@ -1158,6 +1212,23 @@ static inline void sml_mqtt_client_set_publish_received_callback(sml_mqtt_client
 		return;
 	}
 	static_cast<sml_mqtt_cli::mqtt_client*>(handle)->set_publish_received_callback(cb, user_data);
+}
+
+/**
+ * @brief Set the per-operation QoS timeout
+ * @param handle Client handle
+ * @param ms Timeout in milliseconds; 0 to disable
+ *
+ * If live() is called and a QoS 1/2 acknowledgment has not arrived within
+ * this time, the in-flight operation is abandoned and the SM returns to
+ * Connected.  Defaults to CONFIG_SML_MQTT_CLI_PUBLISH_TIMEOUT_MS.
+ */
+static inline void sml_mqtt_client_set_publish_timeout_ms(sml_mqtt_client_handle_t handle,
+                                                           int64_t ms) {
+	if (!handle) {
+		return;
+	}
+	static_cast<sml_mqtt_cli::mqtt_client*>(handle)->set_publish_timeout_ms(ms);
 }
 
 } // extern "C"

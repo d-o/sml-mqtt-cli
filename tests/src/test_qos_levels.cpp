@@ -273,3 +273,150 @@ ZTEST(sml_mqtt_qos, test_retained_message)
 
 	disconnect_client(subscriber);
 }
+
+/* -------------------------------------------------------------------------
+ * Timeout tests
+ *
+ * Each test sets a very short timeout (10 ms), triggers a QoS handshake
+ * where the broker absorbs the client packet without replying, waits long
+ * enough for the timer to expire, then calls live() which fires evt_timeout.
+ * The SM should abandon the in-flight operation and return to Connected so
+ * that new operations (e.g. subscribe) can proceed.
+ * ------------------------------------------------------------------------- */
+
+/**
+ * QoS 1 publish timeout: broker receives PUBLISH but never sends PUBACK.
+ * After live() detects the timeout the SM must return to Connected.
+ */
+ZTEST(sml_mqtt_qos, test_publish_qos1_timeout)
+{
+	sml_mqtt_cli::mqtt_client client;
+	connect_client(client, "test_q1_timeout");
+
+	client.set_qos_timeout_ms(10);
+
+	int ret = client.publish("test/timeout/qos1",
+				 reinterpret_cast<const uint8_t *>("x"), 1,
+				 MQTT_QOS_1_AT_LEAST_ONCE, false);
+	zassert_equal(ret, 0, "QoS 1 publish failed: %d", ret);
+
+	/* Broker receives PUBLISH but sends no PUBACK. */
+	fake_broker_absorb(FAKE_MQTT_PKT_PUBLISH);
+
+	/* Wait for the timeout window to pass. */
+	k_msleep(50);
+
+	/* live() must detect the timeout and drive SM back to Connected. */
+	client.live();
+
+	zassert_true(client.is_connected(), "still connected after timeout");
+	zassert_str_equal(client.get_state(), "Connected",
+			  "SM must return to Connected after QoS 1 timeout");
+
+	/* Confirm SM is fully operational: subscribe must reach the broker. */
+	ret = client.subscribe("test/timeout/qos1", MQTT_QOS_0_AT_MOST_ONCE);
+	zassert_equal(ret, 0, "subscribe after timeout failed: %d", ret);
+	fake_broker_process(FAKE_MQTT_PKT_SUBSCRIBE);
+	client_poll_and_input(client);
+	zassert_str_equal(client.get_state(), "Connected",
+			  "SM must be Connected after SUBACK following timeout");
+
+	disconnect_client(client);
+}
+
+/**
+ * QoS 2 publish timeout (no PUBREC): broker receives PUBLISH but never
+ * sends PUBREC.  The SM is stuck in qos2 state; live() must time it out.
+ */
+ZTEST(sml_mqtt_qos, test_publish_qos2_timeout_pubrec)
+{
+	sml_mqtt_cli::mqtt_client client;
+	connect_client(client, "test_q2_timeout_pubrec");
+
+	client.set_qos_timeout_ms(10);
+
+	int ret = client.publish("test/timeout/qos2/pubrec",
+				 reinterpret_cast<const uint8_t *>("x"), 1,
+				 MQTT_QOS_2_EXACTLY_ONCE, false);
+	zassert_equal(ret, 0, "QoS 2 publish failed: %d", ret);
+
+	/* Broker receives PUBLISH but sends no PUBREC. */
+	fake_broker_absorb(FAKE_MQTT_PKT_PUBLISH);
+
+	k_msleep(50);
+	client.live();
+
+	zassert_true(client.is_connected(), "still connected after timeout");
+	zassert_str_equal(client.get_state(), "Connected",
+			  "SM must return to Connected after QoS 2/no-PUBREC timeout");
+
+	disconnect_client(client);
+}
+
+/**
+ * QoS 2 publish timeout (no PUBCOMP): PUBREC arrives normally, PUBREL is
+ * sent, but the broker never sends PUBCOMP.  The SM is stuck in releasing;
+ * live() must time it out.
+ */
+ZTEST(sml_mqtt_qos, test_publish_qos2_timeout_pubcomp)
+{
+	sml_mqtt_cli::mqtt_client client;
+	connect_client(client, "test_q2_timeout_pubcomp");
+
+	client.set_qos_timeout_ms(10);
+
+	int ret = client.publish("test/timeout/qos2/pubcomp",
+				 reinterpret_cast<const uint8_t *>("x"), 1,
+				 MQTT_QOS_2_EXACTLY_ONCE, false);
+	zassert_equal(ret, 0, "QoS 2 publish failed: %d", ret);
+
+	/* Normal first step: broker sends PUBREC, client sends PUBREL. */
+	fake_broker_process(FAKE_MQTT_PKT_PUBLISH);
+	client_poll_and_input(client);
+
+	/* Broker receives PUBREL but sends no PUBCOMP. */
+	fake_broker_absorb(FAKE_MQTT_PKT_PUBREL);
+
+	k_msleep(50);
+	client.live();
+
+	zassert_true(client.is_connected(), "still connected after timeout");
+	zassert_str_equal(client.get_state(), "Connected",
+			  "SM must return to Connected after QoS 2/no-PUBCOMP timeout");
+
+	disconnect_client(client);
+}
+
+/**
+ * QoS 2 receive timeout: broker sends a QoS 2 PUBLISH, client sends PUBREC,
+ * but the broker never sends PUBREL.  The receiving_sm is stuck in
+ * waiting_rel; live() must time it out.
+ */
+ZTEST(sml_mqtt_qos, test_receive_qos2_timeout)
+{
+	sml_mqtt_cli::mqtt_client client;
+	connect_client(client, "test_recv_q2_timeout");
+
+	client.set_qos_timeout_ms(10);
+
+	/* Broker proactively sends a QoS 2 PUBLISH to the client. */
+	fake_broker_send_qos2_publish("test/timeout/recv/qos2",
+				      reinterpret_cast<const uint8_t *>("hello"), 5,
+				      0x0042u);
+
+	/* Client receives PUBLISH, fires MQTT_EVT_PUBLISH, sends PUBREC,
+	 * and enters receiving_sm's waiting_rel state. */
+	client_poll_and_input(client);
+
+	/* Broker receives PUBREC but sends no PUBREL. */
+	fake_broker_absorb(FAKE_MQTT_PKT_PUBREC);
+
+	k_msleep(50);
+	client.live();
+
+	zassert_true(client.is_connected(), "still connected after receive timeout");
+	zassert_str_equal(client.get_state(), "Connected",
+			  "SM must return to Connected after QoS 2 receive timeout");
+
+	disconnect_client(client);
+}

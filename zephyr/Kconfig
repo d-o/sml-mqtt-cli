@@ -68,4 +68,14 @@ config SML_MQTT_CLI_KEEPALIVE_SEC
 	  The broker will close the connection if no messages are
 	  received within 1.5x this interval. Set to 0 to disable.
 
+config SML_MQTT_CLI_PUBLISH_TIMEOUT_MS
+	int "QoS publish/receive operation timeout in milliseconds"
+	default 5000
+	help
+	  Maximum time to wait for a QoS 1/2 protocol acknowledgment
+	  (PUBACK, PUBREC, PUBCOMP, or PUBREL for incoming QoS 2).
+	  When live() is called and the elapsed time exceeds this value,
+	  the in-flight operation is abandoned and the state machine
+	  returns to Connected.  Set to 0 to disable timeouts.
+
 endif # LIB_SML_MQTT_CLI

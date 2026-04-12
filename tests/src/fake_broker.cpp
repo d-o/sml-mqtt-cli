@@ -36,6 +36,7 @@ static int      c_sock = -1;                       /* accepted client socket  */
 static uint8_t  broker_buf[BROKER_BUF_SIZE];       /* accumulation buffer     */
 static size_t   broker_offset = 0;                 /* valid bytes in buf      */
 static char     broker_topic[BROKER_TOPIC_MAX];    /* topic from SUBSCRIBE    */
+static bool     s_no_response = false;             /* set by fake_broker_absorb */
 
 /* -------------------------------------------------------------------------
  * Pre-built fixed-length response packets
@@ -102,6 +103,12 @@ static void dispatch_packet(uint8_t type_byte,
 			    const uint8_t *var_hdr,
 			    uint32_t remaining_len)
 {
+	/* fake_broker_absorb() sets this flag to suppress the normal response. */
+	if (s_no_response) {
+		s_no_response = false;
+		return;
+	}
+
 	uint8_t type  = type_byte & 0xF0u;
 	uint8_t flags = type_byte & 0x0Fu;
 
@@ -353,6 +360,71 @@ void fake_broker_destroy(void)
 
 	/* Allow the TCP stack to release TIME_WAIT resources. */
 	k_msleep(10);
+}
+
+/* QoS bits live at [2:1] of the PUBLISH fixed-header byte (MQTT 3.1.1 §3.3.1). */
+static void send_publish_packet(uint8_t qos, uint16_t msg_id,
+				const char *topic, const uint8_t *payload,
+				size_t len)
+{
+	uint16_t topic_len = (uint16_t)strlen(topic);
+	uint8_t  type_byte = (uint8_t)(0x30u | ((uint8_t)qos << 1u));
+	uint32_t remaining = 2u + (uint32_t)topic_len
+			   + (qos != 0u ? 2u : 0u)
+			   + (uint32_t)len;
+
+	send_fixed_header(type_byte, remaining);
+
+	uint8_t tlen[2] = {
+		(uint8_t)(topic_len >> 8u),
+		(uint8_t)(topic_len & 0xFFu)
+	};
+	broker_send(tlen, 2u);
+	broker_send((const uint8_t *)topic, topic_len);
+
+	if (qos != 0u) {
+		uint8_t pid[2] = {
+			(uint8_t)(msg_id >> 8u),
+			(uint8_t)(msg_id & 0xFFu)
+		};
+		broker_send(pid, 2u);
+	}
+
+	if (payload != NULL && len > 0u) {
+		broker_send(payload, len);
+	}
+}
+
+void fake_broker_send_qos0_publish(const char *topic, const uint8_t *payload,
+				   size_t len)
+{
+	zassert_true(c_sock >= 0, "fake_broker_send_qos0_publish: no client connected");
+	zassert_not_null(topic, "fake_broker_send_qos0_publish: topic is NULL");
+	send_publish_packet(0u, 0u, topic, payload, len);
+}
+
+void fake_broker_send_qos1_publish(const char *topic, const uint8_t *payload,
+				   size_t len, uint16_t msg_id)
+{
+	zassert_true(c_sock >= 0, "fake_broker_send_qos1_publish: no client connected");
+	zassert_not_null(topic, "fake_broker_send_qos1_publish: topic is NULL");
+	zassert_true(msg_id != 0u, "fake_broker_send_qos1_publish: msg_id must be non-zero");
+	send_publish_packet(1u, msg_id, topic, payload, len);
+}
+
+void fake_broker_absorb(uint8_t expected_type)
+{
+	s_no_response = true;
+	fake_broker_process(expected_type);
+}
+
+void fake_broker_send_qos2_publish(const char *topic, const uint8_t *payload,
+				   size_t len, uint16_t msg_id)
+{
+	zassert_true(c_sock >= 0, "fake_broker_send_qos2_publish: no client connected");
+	zassert_not_null(topic, "fake_broker_send_qos2_publish: topic is NULL");
+	zassert_true(msg_id != 0u, "fake_broker_send_qos2_publish: msg_id must be non-zero");
+	send_publish_packet(2u, msg_id, topic, payload, len);
 }
 
 void fake_broker_process(uint8_t expected_type)
