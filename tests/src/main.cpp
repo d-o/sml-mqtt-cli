@@ -98,5 +98,8 @@ ZTEST_SUITE(sml_mqtt_pubsub,      NULL, NULL, broker_before, broker_after, NULL)
 ZTEST_SUITE(sml_mqtt_qos,         NULL, NULL, broker_before, broker_after, NULL);
 ZTEST_SUITE(sml_mqtt_multiple,    NULL, NULL, broker_before, broker_after, NULL);
 ZTEST_SUITE(sml_mqtt_concurrent,  NULL, NULL, broker_before, broker_after, NULL);
+/* TLS config tests do not use the fake broker (all paths return before
+ * mqtt_connect() is called, or check context fields set by init()). */
+ZTEST_SUITE(sml_mqtt_tls,         NULL, NULL, NULL,          NULL,         NULL);
 
 #endif /* !CONFIG_ETH_NATIVE_TAP */

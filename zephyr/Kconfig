@@ -78,4 +78,15 @@ config SML_MQTT_CLI_PUBLISH_TIMEOUT_MS
 	  the in-flight operation is abandoned and the state machine
 	  returns to Connected.  Set to 0 to disable timeouts.
 
+config SML_MQTT_CLI_MAX_TLS_SEC_TAGS
+	int "Maximum TLS security tags per client instance"
+	default 1
+	depends on MQTT_LIB_TLS
+	help
+	  Number of TLS security tag slots stored inside each mqtt_client
+	  instance.  Each slot holds a sec_tag_t integer copied from the
+	  tls_config passed to init().  Increase this if a single client
+	  needs more than one credential (e.g. a CA certificate tag plus a
+	  client certificate/key tag for mutual TLS).
+
 endif # LIB_SML_MQTT_CLI

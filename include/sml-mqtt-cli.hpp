@@ -62,6 +62,10 @@ namespace sml_mqtt_cli {
 #define CONFIG_SML_MQTT_CLI_PUBLISH_TIMEOUT_MS 5000
 #endif
 
+#ifndef CONFIG_SML_MQTT_CLI_MAX_TLS_SEC_TAGS
+#define CONFIG_SML_MQTT_CLI_MAX_TLS_SEC_TAGS 1
+#endif
+
 // ============================================================================
 // Forward declarations and types
 // ============================================================================
@@ -71,6 +75,26 @@ class mqtt_client;
 // Callback types for C API compatibility
 using state_change_cb_t = void (*)(void *user_data, const char *old_state, const char *new_state);
 using publish_received_cb_t = void (*)(void *user_data, const char *topic, const uint8_t *payload, size_t len, enum mqtt_qos qos);
+
+// ============================================================================
+// TLS configuration (only available when CONFIG_MQTT_LIB_TLS is enabled)
+// ============================================================================
+
+#if defined(CONFIG_MQTT_LIB_TLS)
+/**
+ * @brief TLS credentials for an MQTT client instance.
+ *
+ * Security tags must be pre-registered with Zephyr's TLS credential store
+ * via tls_credential_add() before calling init().  The library copies the
+ * tag IDs into its own context so the caller's array does not need to
+ * outlive the init() call.
+ */
+struct tls_config {
+	const sec_tag_t *sec_tag_list;  ///< Array of registered security tags
+	size_t           sec_tag_count; ///< Number of tags (max CONFIG_SML_MQTT_CLI_MAX_TLS_SEC_TAGS)
+	int              peer_verify;   ///< TLS_PEER_VERIFY_REQUIRED or TLS_PEER_VERIFY_NONE
+};
+#endif /* CONFIG_MQTT_LIB_TLS */
 
 // ============================================================================
 // Events for state machine
@@ -178,6 +202,18 @@ struct mqtt_context {
 	// Broker details
 	struct sockaddr_storage broker_addr;
 
+#if defined(CONFIG_MQTT_LIB_TLS)
+	// TLS credentials (copied from tls_config at init time)
+	sec_tag_t tls_sec_tags[CONFIG_SML_MQTT_CLI_MAX_TLS_SEC_TAGS];
+	size_t    tls_sec_tag_count;
+	int       tls_peer_verify;
+	bool      tls_enabled;
+	// Hostname copy — Zephyr's mqtt_sec_config.hostname is a const char*
+	// that must remain valid for the lifetime of the connection.  We
+	// copy it here so callers do not need to keep their string alive.
+	char      tls_hostname[CONFIG_SML_MQTT_CLI_MAX_CLIENT_ID_LEN];
+#endif
+
 	// Subscription tracking
 	struct subscription {
 		char topic[CONFIG_SML_MQTT_CLI_MAX_TOPIC_LEN];
@@ -198,7 +234,7 @@ struct mqtt_context {
 	// the correct typed completion event even if both paths are active.
 	int64_t publish_op_start_ms;  // 0 = no active outgoing QoS 1/2 operation
 	int64_t receive_op_start_ms;  // 0 = no active incoming QoS 2 PUBREL wait
-	int64_t publish_timeout_ms;   // configurable; 0 = disabled
+	int64_t qos_timeout_ms;       // shared threshold for both paths; 0 = disabled
 
 	// Callbacks for C API
 	state_change_cb_t state_change_cb;
@@ -213,9 +249,15 @@ struct mqtt_context {
 		  broker_addr{}, subscriptions{}, connected(false), next_message_id(1),
 		  pending_message_id(0), current_payload_len(0), last_activity_ms(0),
 		  connect_start_ms(0), publish_op_start_ms(0), receive_op_start_ms(0),
-		  publish_timeout_ms(CONFIG_SML_MQTT_CLI_PUBLISH_TIMEOUT_MS),
+		  qos_timeout_ms(CONFIG_SML_MQTT_CLI_PUBLISH_TIMEOUT_MS),
 		  state_change_cb(nullptr), publish_received_cb(nullptr),
-		  user_data(nullptr), parent(nullptr) {}
+		  user_data(nullptr), parent(nullptr)
+#if defined(CONFIG_MQTT_LIB_TLS)
+		  , tls_sec_tags{}, tls_sec_tag_count(0),
+		  tls_peer_verify(TLS_PEER_VERIFY_REQUIRED), tls_enabled(false),
+		  tls_hostname{}
+#endif
+	{}
 
 	~mqtt_context() = default;
 
@@ -533,8 +575,12 @@ public:
 	mqtt_client(const mqtt_client&) = delete;
 	mqtt_client& operator=(const mqtt_client&) = delete;
 
-	// Initialize client with ID
+	// Initialize client with ID (and optional TLS credentials)
+#if defined(CONFIG_MQTT_LIB_TLS)
+	int init(const char *client_id, const tls_config *tls = nullptr) noexcept {
+#else
 	int init(const char *client_id) noexcept {
+#endif
 		if (!client_id || strlen(client_id) >= CONFIG_SML_MQTT_CLI_MAX_CLIENT_ID_LEN) {
 			return -EINVAL;
 		}
@@ -557,6 +603,20 @@ public:
 		ctx_.client.protocol_version = MQTT_VERSION_3_1_1;
 		ctx_.client.user_data = this;
 
+#if defined(CONFIG_MQTT_LIB_TLS)
+		if (tls) {
+			if (!tls->sec_tag_list || tls->sec_tag_count == 0 ||
+			    tls->sec_tag_count > CONFIG_SML_MQTT_CLI_MAX_TLS_SEC_TAGS) {
+				return -EINVAL;
+			}
+			memcpy(ctx_.tls_sec_tags, tls->sec_tag_list,
+			       tls->sec_tag_count * sizeof(sec_tag_t));
+			ctx_.tls_sec_tag_count = tls->sec_tag_count;
+			ctx_.tls_peer_verify   = tls->peer_verify;
+			ctx_.tls_enabled       = true;
+		}
+#endif
+
 		return 0;
 	}
 
@@ -564,6 +624,17 @@ public:
 	int connect(const char *hostname, uint16_t port, bool use_tls = false) noexcept {
 		if (!hostname) {
 			return -EINVAL;
+		}
+
+		// Validate TLS credentials before doing any network work
+		if (use_tls) {
+#if defined(CONFIG_MQTT_LIB_TLS)
+			if (!ctx_.tls_enabled) {
+				return -EINVAL;
+			}
+#else
+			return -ENOTSUP;
+#endif
 		}
 
 		// Resolve hostname
@@ -586,8 +657,12 @@ public:
 		if (use_tls) {
 #if defined(CONFIG_MQTT_LIB_TLS)
 			ctx_.client.transport.type = MQTT_TRANSPORT_SECURE;
-#else
-			return -ENOTSUP;
+			ctx_.client.transport.tls.config.sec_tag_list  = ctx_.tls_sec_tags;
+			ctx_.client.transport.tls.config.sec_tag_count = ctx_.tls_sec_tag_count;
+			ctx_.client.transport.tls.config.peer_verify   = ctx_.tls_peer_verify;
+			strncpy(ctx_.tls_hostname, hostname, sizeof(ctx_.tls_hostname) - 1);
+			ctx_.tls_hostname[sizeof(ctx_.tls_hostname) - 1] = '\0';
+			ctx_.client.transport.tls.config.hostname      = ctx_.tls_hostname;
 #endif
 		} else {
 			ctx_.client.transport.type = MQTT_TRANSPORT_NON_SECURE;
@@ -765,23 +840,23 @@ public:
 
 	// Keep connection alive (call periodically).
 	// Also drives per-operation QoS timeouts: if a QoS 1/2 handshake has been
-	// waiting longer than publish_timeout_ms, the in-flight operation is
-	// abandoned and the SM returns to Connected so new operations can proceed.
+	// waiting longer than qos_timeout_ms, the in-flight operation is abandoned
+	// and the SM returns to Connected so new operations can proceed.
 	int live() noexcept {
 		if (!ctx_.connected) {
 			return -ENOTCONN;
 		}
-		if (ctx_.publish_timeout_ms > 0) {
+		if (ctx_.qos_timeout_ms > 0) {
 			int64_t now = k_uptime_get();
 			if (ctx_.publish_op_start_ms != 0 &&
-			    (now - ctx_.publish_op_start_ms) >= ctx_.publish_timeout_ms) {
+			    (now - ctx_.publish_op_start_ms) >= ctx_.qos_timeout_ms) {
 				LOG_WRN("QoS publish operation timed out");
 				ctx_.publish_op_start_ms = 0;
 				ctx_.pending_message_id  = 0;
 				sm_.process_event(evt_publish_done{});
 			}
 			if (ctx_.receive_op_start_ms != 0 &&
-			    (now - ctx_.receive_op_start_ms) >= ctx_.publish_timeout_ms) {
+			    (now - ctx_.receive_op_start_ms) >= ctx_.qos_timeout_ms) {
 				LOG_WRN("QoS receive operation timed out");
 				ctx_.receive_op_start_ms = 0;
 				sm_.process_event(evt_receive_done{});
@@ -790,9 +865,10 @@ public:
 		return mqtt_live(&ctx_.client);
 	}
 
-	// Set per-operation QoS timeout.  Pass 0 to disable.
-	void set_publish_timeout_ms(int64_t ms) noexcept {
-		ctx_.publish_timeout_ms = ms;
+	// Set per-operation QoS timeout (applies to both publish and receive paths).
+	// Pass 0 to disable.
+	void set_qos_timeout_ms(int64_t ms) noexcept {
+		ctx_.qos_timeout_ms = ms;
 	}
 
 	// Check if connected
@@ -1074,6 +1150,40 @@ static inline int sml_mqtt_client_init(sml_mqtt_client_handle_t handle, const ch
 	return static_cast<sml_mqtt_cli::mqtt_client*>(handle)->init(client_id);
 }
 
+#if defined(CONFIG_MQTT_LIB_TLS)
+/**
+ * @brief TLS configuration for C API consumers
+ *
+ * Security tags must be pre-registered via tls_credential_add() before
+ * calling sml_mqtt_client_init_tls().
+ */
+typedef struct {
+	const sec_tag_t *sec_tag_list;  /**< Array of registered security tags */
+	size_t           sec_tag_count; /**< Number of tags */
+	int              peer_verify;   /**< TLS_PEER_VERIFY_REQUIRED or TLS_PEER_VERIFY_NONE */
+} sml_mqtt_tls_config_t;
+
+/**
+ * @brief Initialize MQTT client with TLS credentials
+ * @param handle Client handle
+ * @param client_id Client identifier string
+ * @param tls TLS configuration (sec_tag_list, peer_verify)
+ * @return 0 on success, negative error code on failure
+ */
+static inline int sml_mqtt_client_init_tls(sml_mqtt_client_handle_t handle, const char *client_id,
+                                            const sml_mqtt_tls_config_t *tls) {
+	if (!handle || !tls) {
+		return -EINVAL;
+	}
+	sml_mqtt_cli::tls_config cpp_tls = {
+		.sec_tag_list  = tls->sec_tag_list,
+		.sec_tag_count = tls->sec_tag_count,
+		.peer_verify   = tls->peer_verify,
+	};
+	return static_cast<sml_mqtt_cli::mqtt_client*>(handle)->init(client_id, &cpp_tls);
+}
+#endif /* CONFIG_MQTT_LIB_TLS */
+
 /**
  * @brief Connect to MQTT broker
  * @param handle Client handle
@@ -1215,7 +1325,7 @@ static inline void sml_mqtt_client_set_publish_received_callback(sml_mqtt_client
 }
 
 /**
- * @brief Set the per-operation QoS timeout
+ * @brief Set the per-operation QoS timeout (applies to both publish and receive paths)
  * @param handle Client handle
  * @param ms Timeout in milliseconds; 0 to disable
  *
@@ -1223,12 +1333,12 @@ static inline void sml_mqtt_client_set_publish_received_callback(sml_mqtt_client
  * this time, the in-flight operation is abandoned and the SM returns to
  * Connected.  Defaults to CONFIG_SML_MQTT_CLI_PUBLISH_TIMEOUT_MS.
  */
-static inline void sml_mqtt_client_set_publish_timeout_ms(sml_mqtt_client_handle_t handle,
-                                                           int64_t ms) {
+static inline void sml_mqtt_client_set_qos_timeout_ms(sml_mqtt_client_handle_t handle,
+                                                       int64_t ms) {
 	if (!handle) {
 		return;
 	}
-	static_cast<sml_mqtt_cli::mqtt_client*>(handle)->set_publish_timeout_ms(ms);
+	static_cast<sml_mqtt_cli::mqtt_client*>(handle)->set_qos_timeout_ms(ms);
 }
 
 } // extern "C"

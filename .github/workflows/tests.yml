@@ -118,6 +118,7 @@ jobs:
           west twister \
             -T sml-mqtt-cli/tests \
             -p qemu_riscv32 \
+            --test libraries.sml_mqtt_cli.unit \
             --inline-logs \
             -x "ZEPHYR_MODULES=${GITHUB_WORKSPACE}/boost-sml;${GITHUB_WORKSPACE}/sml-mqtt-cli"
 
@@ -129,5 +130,66 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: twister-${{ github.run_number }}
+          path: twister-out/
+          retention-days: 30
+
+  twister-tls:
+    name: "Twister TLS (qemu_riscv32)"
+    runs-on: ubuntu-22.04
+    container:
+      image: ghcr.io/zephyrproject-rtos/ci:v0.28.6
+      options: '--entrypoint /bin/bash'
+
+    steps:
+      - name: Apply workspace ownership workaround
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          path: sml-mqtt-cli
+
+      - name: Cache west workspace
+        id: west-cache-tls
+        uses: actions/cache@v4
+        with:
+          path: |
+            .west
+            zephyr
+            boost-sml
+            modules/crypto/mbedtls
+          key: west-tls-v4.3-${{ hashFiles('sml-mqtt-cli/tests/west.yml') }}
+
+      - name: Initialise west workspace
+        if: steps.west-cache-tls.outputs.cache-hit != 'true'
+        run: |
+          west init -m https://github.com/zephyrproject-rtos/zephyr \
+            --mr v4.3-branch .
+          west update zephyr mbedtls
+          git clone --depth 1 --branch zephyr_module \
+            https://github.com/d-o/sml.git boost-sml
+
+      - name: Export Zephyr SDK path
+        run: |
+          echo "ZEPHYR_SDK_INSTALL_DIR=/opt/toolchains/zephyr-sdk-${ZSDK_VERSION}" \
+            >> "$GITHUB_ENV"
+
+      # The TLS scenario uses extra_configs in testcase.yaml to enable
+      # MQTT_LIB_TLS and the mbedTLS stack.  mbedtls must be in
+      # ZEPHYR_MODULES so its Kconfig is loaded.
+      - name: Run Twister (TLS)
+        run: |
+          west twister \
+            -T sml-mqtt-cli/tests \
+            -p qemu_riscv32 \
+            --test libraries.sml_mqtt_cli.tls \
+            --inline-logs \
+            -x "ZEPHYR_MODULES=${GITHUB_WORKSPACE}/boost-sml;${GITHUB_WORKSPACE}/sml-mqtt-cli;${GITHUB_WORKSPACE}/modules/crypto/mbedtls"
+
+      - name: Upload Twister artifacts (TLS)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: twister-tls-${{ github.run_number }}
           path: twister-out/
           retention-days: 30

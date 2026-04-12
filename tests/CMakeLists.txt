@@ -53,14 +53,21 @@ if(CONFIG_ETH_NATIVE_TAP)
   message(STATUS "Integration test broker: "
           "${SML_MQTT_TEST_BROKER_HOST}:${SML_MQTT_TEST_BROKER_PORT}")
 
+  # TLS broker port — separate cache variable so plaintext and TLS tests can
+  # target different ports without rebuilding.
+  set(SML_MQTT_TEST_TLS_PORT "8883" CACHE STRING
+      "Broker TLS port for TLS integration tests (native_sim)")
+
   zephyr_compile_definitions(
       SML_MQTT_TEST_BROKER_HOST="${SML_MQTT_TEST_BROKER_HOST}"
       SML_MQTT_TEST_BROKER_PORT=${SML_MQTT_TEST_BROKER_PORT}
+      SML_MQTT_TEST_TLS_PORT=${SML_MQTT_TEST_TLS_PORT}
   )
 
   target_sources(app PRIVATE
     src/main.cpp
     src/test_integration_broker.cpp
+    src/test_tls_integration.cpp
   )
 else()
   target_sources(app PRIVATE
@@ -71,6 +78,7 @@ else()
     src/test_qos_levels.cpp
     src/test_multiple_clients.cpp
     src/test_concurrent_ops.cpp
+    src/test_tls_config.cpp
   )
 endif()
 

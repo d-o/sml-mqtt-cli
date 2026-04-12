@@ -3,17 +3,26 @@
 #
 # Twister test descriptor for the sml-mqtt-cli test suite.
 #
-# Two test variants:
+# Three test variants:
 #
 #   libraries.sml_mqtt_cli.unit (qemu_riscv32)
-#     20 unit tests using the in-process fake broker + Zephyr loopback.
+#     Unit tests using the in-process fake broker + Zephyr loopback.
 #     No external broker, no network hardware, no root required.
 #
 #     west twister -T sml-mqtt-cli/tests -p qemu_riscv32 \
-#       --cmake-args="-DZEPHYR_MODULES=$PWD/boost-sml;$PWD/sml-mqtt-cli"
+#       -x "ZEPHYR_MODULES=$PWD/boost-sml;$PWD/sml-mqtt-cli"
+#
+#   libraries.sml_mqtt_cli.tls (qemu_riscv32)
+#     TLS configuration tests built with the mbedTLS overlay.
+#     No external broker — tests validate credential storage and
+#     transport setup only.  Requires mbedtls in ZEPHYR_MODULES.
+#
+#     west twister -T sml-mqtt-cli/tests -p qemu_riscv32 \
+#       --test libraries.sml_mqtt_cli.tls \
+#       -x "ZEPHYR_MODULES=$PWD/boost-sml;$PWD/sml-mqtt-cli;$PWD/modules/crypto/mbedtls"
 #
 #   libraries.sml_mqtt_cli.integration (native_sim)
-#     7 integration tests against a real Mosquitto broker via TAP Ethernet.
+#     Integration tests against a real Mosquitto broker via TAP Ethernet.
 #     Requires the setup script to be run first (needs root for ip tuntap):
 #
 #       sudo sml-mqtt-cli/tests/scripts/run_integration_tests.sh --setup-only
@@ -21,12 +30,7 @@
 #     Then run with Twister:
 #       west twister -T sml-mqtt-cli/tests \
 #         -p native_sim --test libraries.sml_mqtt_cli.integration \
-#         --cmake-args="-DZEPHYR_MODULES=$PWD/boost-sml;$PWD/sml-mqtt-cli"
-#
-#     Or directly (quicker during development):
-#       west build -p always -s sml-mqtt-cli/tests -b native_sim \
-#         -- -DZEPHYR_MODULES="$PWD/boost-sml;$PWD/sml-mqtt-cli"
-#       sudo ./build/zephyr/zephyr.exe
+#         -x "ZEPHYR_MODULES=$PWD/boost-sml;$PWD/sml-mqtt-cli"
 
 tests:
   libraries.sml_mqtt_cli.unit:
@@ -39,6 +43,24 @@ tests:
     tags: mqtt sml networking ztest
     timeout: 120
     min_ram: 64
+
+  libraries.sml_mqtt_cli.tls:
+    harness: ztest
+    harness_config:
+      type: one_line
+      regex:
+        - "PROJECT EXECUTION SUCCESSFUL"
+    platform_allow: qemu_riscv32
+    tags: mqtt sml networking ztest tls
+    timeout: 120
+    min_ram: 128
+    extra_configs:
+      - CONFIG_MQTT_LIB_TLS=y
+      - CONFIG_NET_SOCKETS_SOCKOPT_TLS=y
+      - CONFIG_TLS_CREDENTIALS=y
+      - CONFIG_HEAP_MEM_POOL_SIZE=65536
+      - CONFIG_NET_TEST=y
+      - CONFIG_NET_LOOPBACK=y
 
   libraries.sml_mqtt_cli.integration:
     harness: ztest
